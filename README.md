@@ -154,6 +154,10 @@ Editable fields include:
   - Ride height (front and rear)
   - Changes apply only to MAIN.
 
+Notes:
+- Cloned cars will always have a CarID of 2000 and up to avoid conflicts with DLC cars. Make sure to edit this number in case you already have cloned cars.
+- Cloned cars will have a year marker of 6969 so you can differentiate them in-game. You can change this to something else, but it's not possible to change the car name itself without creating a new string in a different file, which is out of scope for now.
+
 ### Tab: Engine (Lab + Assign)
 
 - Purpose
