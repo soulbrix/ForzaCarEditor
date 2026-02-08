@@ -27,11 +27,11 @@ You can use it to:
 *   Work across MAIN + DLC data without corrupting runtime dependencies
     
 
-This tool is designed to be **explicit, modular, and transparent**.Nothing is modified unless you explicitly apply a change.
+This tool is designed to be **explicit, modular, and transparent**. Nothing is modified unless you explicitly apply a change.
 
 ### A word of warning
 
-**I cannot code.**Almost all of this tool was created using ChatGPT, based on my understanding of how Forza Motorsport 4’s SLT files work and how the data is connected internally.
+**I cannot code.** Almost all of this tool was created using ChatGPT, based on my understanding of how Forza Motorsport 4’s SLT files work and how the data is connected internally.
 
 Because of that:
 
@@ -42,7 +42,7 @@ Because of that:
 *   Treat this as a research and modding tool, not a polished product
     
 
-**⚠️ Offline modding / research use only.**I cannot take responsibility for lost or corrupted data.
+**⚠️ Offline modding / research use only.** I cannot take responsibility for lost or corrupted data.
 
 General workflow
 ----------------
@@ -116,16 +116,19 @@ Shows all cars found across MAIN and DLC SLTs.
 *   Source (which SLT the car comes from)
     
 
-**Search box**Filters by CarID or MediaName.
+**Search box** 
+Filters by CarID or MediaName.
 
-**Show only cloned**Shows cars that are likely clones:
+**Show only cloned** 
+Shows cars that are likely clones:
 
 *   ModelYear = 6969
     
 *   or CarID ≥ 2000
     
 
-**Sort by**Sort by CarID, MediaName, Year, or Source.
+**Sort by**
+Sort by CarID, MediaName, Year, or Source.
 
 Selecting a car sets the active target for all tabs.
 
@@ -138,15 +141,20 @@ Clone a donor car into MAIN using a proven and safe cloning workflow.
 
 ### Controls
 
-**Backup MAIN before cloning**Recommended. Creates a backup automatically.
+**Backup MAIN before cloning**
+Recommended. Creates a backup automatically.
 
-**New CarID**CarID for the cloned car.By convention, cloned cars should start at **2000 or higher**.
+**New CarID**
+CarID for the cloned car.By convention, cloned cars should start at **2000 or higher**.
 
-**Suggest next**Finds the highest existing CarID across MAIN + DLC and suggests the next safe value.
+**Suggest next**
+Finds the highest existing CarID across MAIN + DLC and suggests the next safe value.
 
-**Year marker**Sets Data\_Car.ModelYear for the clone (default: 6969).Used only for identification.
+**Year marker**
+Sets Data\_Car.ModelYear for the clone (default: 6969).Used only for identification.
 
-**Clone selected donor into MAIN**Clones the currently selected car.
+**Clone selected donor into MAIN**
+Clones the currently selected car.
 
 If the donor is from DLC, MAIN is also scanned for related rows.
 
@@ -191,11 +199,14 @@ Editable fields include:
 *   Unicorn flag
     
 
-**Wheel diameter safety**Front and rear wheel diameters are clamped between **13 and 24**.
+**Wheel diameter safety**
+Front and rear wheel diameters are clamped between **13 and 24**.
 
-**Save changes to MAIN**Writes changes only to MAIN.
+**Save changes to MAIN**
+Writes changes only to MAIN.
 
-**Reload from selected source**Reloads original values from the source SLT.
+**Reload from selected source**
+Reloads original values from the source SLT.
 
 Tab: Body (Data\_CarBody)
 -------------------------
@@ -229,15 +240,19 @@ Tab: Engine (Lab + Assign)
 
 Manage engines and engine assignment.
 
-**Left side**List of all engines across MAIN and DLC.
+**Left side**
+List of all engines across MAIN and DLC.
 
-**Search box**Filter by EngineName or MediaName.
+**Search box**
+Filter by EngineName or MediaName.
 
 ### Buttons
 
-**Assign selected engine as STOCK**Assigns the selected engine as the stock engine for the active car.
+**Assign selected engine as STOCK**
+Assigns the selected engine as the stock engine for the active car.
 
-**Clone selected engine into MAIN + Assign**Clones the engine into MAIN if needed and assigns it safely.
+**Clone selected engine into MAIN + Assign**
+Clones the engine into MAIN if needed and assigns it safely.
 
 ### Engine editor (MAIN only)
 
@@ -268,7 +283,8 @@ Editable fields include:
 *   Carbureted / Diesel / Rotary flags
     
 
-**Important**Engine cloning also clones all required TorqueCurve entries.Missing torque curves will cause crashes during race load.
+**Important**
+Engine cloning also clones all required TorqueCurve entries.Missing torque curves will cause crashes during race load.
 
 Tab: Upgrade Editor
 -------------------
@@ -279,9 +295,11 @@ Edit List\_Upgrade\* tables directly.
 
 This is an advanced feature.
 
-**Table dropdown**Shows all List\_Upgrade\* tables with shortened names(example: EngineCamshaft instead of List\_UpgradeEngineCamshaft)
+**Table dropdown**
+Shows all List\_Upgrade\* tables with shortened names(example: EngineCamshaft instead of List\_UpgradeEngineCamshaft)
 
-**Load rows**Loads rows relevant to the selected car.
+**Load rows**
+Loads rows relevant to the selected car.
 
 The tool automatically detects scope:
 
@@ -307,7 +325,7 @@ The tool automatically detects scope:
 *   Apply edits to MAIN
     
 
-Supports custom upgrade levels beyond the game’s default 0–3.
+Supports custom upgrade levels beyond the game’s default 0–3 (Stock, Sports, Semi-Professional, Professional).
 
 Tab: Constructor (experimental)
 -------------------------------
