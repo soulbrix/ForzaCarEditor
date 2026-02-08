@@ -1,285 +1,370 @@
-# Forza Car Editor
+Forza Car Editor
+================
 
-## Overview
+Overview
+--------
 
-Forza Constructor Studio is a Windows tool for editing and extending car data in Forza Motorsport 4 (Xbox 360).
-It allows you to:
+**Forza Constructor Studio** is a Windows tool for editing and extending car data in _Forza Motorsport 4_ (Xbox 360).
 
-- Load the MAIN SLT and any number of DLC SLTs
-- Clone cars safely into MAIN
-- Edit car, body, engine, drivetrain, and upgrade data
-- Create and edit engines
-- Add, duplicate, and customize upgrade levels (including beyond stock/race)
-- Work across MAIN + DLC data while always writing only to MAIN
+It allows you to safely inspect, clone, and modify cars, engines, and upgrade data stored in the game’s SLT (SQLite) databases, while respecting how the game expects runtime data to be structured.
 
-This tool is designed to be safe, modular, and transparent.
-Nothing is hidden, and no changes are made unless you explicitly apply them.
+The tool supports working across the MAIN SLT and any number of DLC SLTs, while **only ever writing to MAIN**.
+
+You can use it to:
+
+*   Load the MAIN SLT and any number of DLC SLTs
+    
+*   Clone cars safely into MAIN
+    
+*   Clone and assign engines safely
+    
+*   Edit car, body, engine, drivetrain, and upgrade data
+    
+*   Create and edit engines
+    
+*   Add, duplicate, and customize upgrade levels (including beyond stock/race)
+    
+*   Work across MAIN + DLC data without corrupting runtime dependencies
+    
+
+This tool is designed to be **explicit, modular, and transparent**.Nothing is modified unless you explicitly apply a change.
 
 ### A word of warning
-**I cannot code, so almost all of this app was created using ChatGPT.**
-I simply fed it my knowledge of how the SLT file works and the connections between the cars.
 
-**⚠️ Offline modding / research use only.**
-Always back up your original files. I cannot take responsibility for lost or corrupted data.
+**I cannot code.**Almost all of this tool was created using ChatGPT, based on my understanding of how Forza Motorsport 4’s SLT files work and how the data is connected internally.
 
-## General workflow
+Because of that:
 
-1. Select MAIN SLT
-2. (Optional) Select DLC folder
-3. Reload sources
-4. Select a car from the left list
-5. Use tabs on the right to clone or edit
-6. Save/apply changes (always writes only to MAIN)
+*   Always back up your files
+    
+*   Expect rough edges
+    
+*   Treat this as a research and modding tool, not a polished product
+    
+
+**⚠️ Offline modding / research use only.**I cannot take responsibility for lost or corrupted data.
+
+General workflow
+----------------
+
+1.  Select MAIN SLT
+    
+2.  (Optional) Select DLC folder
+    
+3.  Reload sources
+    
+4.  Select a car from the left list
+    
+5.  Use tabs on the right to clone or edit
+    
+6.  Apply changes (always writes only to MAIN)
+    
 
 ### MAIN vs DLC behavior (important)
 
-MAIN SLT is the only file ever modified
-DLC SLTs are read-only
-DLC cars and engines can be selected as donors
-If something does not exist in MAIN, the tool will clone it when required
-This avoids corruption and matches how Forza expects data to exist at runtime.
+*   **MAIN SLT is the only file ever modified**
+    
+*   **DLC SLTs are read-only**
+    
+*   DLC cars and engines can be selected as donors
+    
+*   If something required by a clone does not exist in MAIN, the tool will clone it automatically when needed
+    
 
-### Top bar buttons
+This mirrors how Forza expects data to exist at runtime and avoids crashes caused by missing dependencies.
 
-- Select MAIN SLT
+Top bar buttons
+---------------
+
+### Select MAIN SLT
+
 Choose the main database file. This is required before doing anything else.
 
-- Select DLC Folder (optional)
-Choose a folder that contains DLC SLTs.
-The tool scans recursively, so subfolders are supported.
+### Select DLC Folder (optional)
 
-- Reload sources
-Rebuilds the internal list of SLTs (MAIN + DLC).
-Use this whenever you change files on disk.
+Choose a folder containing DLC SLTs.The tool scans recursively, so subfolders are supported.
 
-- Build lookup cache
-Builds human-readable name lookups (EnginePlacement, Materials, Cylinders, etc).
-Required for dropdowns to populate correctly.
+### Reload sources
 
-- Backup MAIN now
+Rebuilds the internal list of SLTs (MAIN + DLC).Use this whenever you change files on disk.
+
+### Build lookup cache
+
+Builds human-readable lookup tables (EnginePlacement, Materials, Cylinders, etc).Required for dropdowns to populate correctly.
+
+### Backup MAIN now
+
 Creates a timestamped backup of the MAIN SLT.
 
-- Validate selected car (basic)
+### Validate selected car (basic)
+
 Runs basic sanity checks on the selected car’s references.
 
-### Left panel: Car list
+Left panel: Car list
+--------------------
 
-This list shows all cars found across MAIN and DLC SLTs.
+Shows all cars found across MAIN and DLC SLTs.
 
-- Columns:
-  - CarID
-  - MediaName (more readable than string IDs)
-  - Year
-  - Source (which SLT it comes from)
+**Columns**
 
-- Search box
-Filters by CarID or MediaName.
+*   CarID
+    
+*   MediaName (more readable than string IDs)
+    
+*   Year
+    
+*   Source (which SLT the car comes from)
+    
 
-- Show only cloned
-Shows cars that are likely clones:
-  - ModelYear = 6969
-  - or CarID >= 2000
+**Search box**Filters by CarID or MediaName.
 
-- Sort by
-Sort the list by CarID, MediaName, Year, or Source.
+**Show only cloned**Shows cars that are likely clones:
 
-- Selecting a car
-Selecting a car here sets the active target for all tabs.
+*   ModelYear = 6969
+    
+*   or CarID ≥ 2000
+    
 
-### Tab: Cloner
+**Sort by**Sort by CarID, MediaName, Year, or Source.
 
-- Purpose
-Clone a donor car into MAIN.
-This uses the proven Car Cloner logic and does not interfere with Constructor editing.
+Selecting a car sets the active target for all tabs.
 
-Controls
+Tab: Cloner
+-----------
 
-- Backup MAIN before cloning
-Recommended. Creates a backup automatically.
+### Purpose
 
-- New CarID
-The CarID for the cloned car.
-By convention, cloned cars should start at 2000 or higher.
+Clone a donor car into MAIN using a proven and safe cloning workflow.
 
-- Suggest next
-Automatically finds the highest existing CarID and suggests the next safe value.
+### Controls
 
-- Year marker
-Sets Data_Car.Year for the cloned car (default: 6969).
-This is purely for identification and does not affect gameplay.
+**Backup MAIN before cloning**Recommended. Creates a backup automatically.
 
-- Clone selected donor into MAIN
-Clones the currently selected car (from the left list).
-If the donor is from DLC, MAIN is also scanned for extra related rows.
+**New CarID**CarID for the cloned car.By convention, cloned cars should start at **2000 or higher**.
 
-What gets cloned
-  - Data_Car
-  - Data_CarBody
-  - Stock upgrade rows
-  - Upgrade physics (with safe re-keying)
-  - Required references only (to avoid crashes)
+**Suggest next**Finds the highest existing CarID across MAIN + DLC and suggests the next safe value.
 
-### Tab: Car (Data_Car)
+**Year marker**Sets Data\_Car.ModelYear for the clone (default: 6969).Used only for identification.
 
-- Purpose
+**Clone selected donor into MAIN**Clones the currently selected car.
+
+If the donor is from DLC, MAIN is also scanned for related rows.
+
+### What gets cloned
+
+*   Data\_Car
+    
+*   Data\_CarBody
+    
+*   Required stock upgrade rows only
+    
+*   Upgrade physics and references with safe re-keying
+    
+*   Combo and dependency tables only when required
+    
+
+This avoids duplicated globals and runtime crashes.
+
+Tab: Car (Data\_Car)
+--------------------
+
+### Purpose
+
 Edit core car parameters.
 
 Editable fields include:
-- CarTypeID (Production / Race / Pre-Tuned)
-- EnginePlacementID (dropdown)
-- MaterialTypeID (dropdown)
-- Weight and distribution
-- Gear count
-- Tire sizes and wheel diameters
-- Base cost
-- Unicorn flag
 
-- Wheel diameter safety
-Front/Rear wheel diameter values are clamped between 13 and 24.
+*   CarTypeID (Production / Race / Pre-Tuned)
+    
+*   EnginePlacementID (dropdown)
+    
+*   MaterialTypeID (dropdown)
+    
+*   Weight and weight distribution
+    
+*   Gear count
+    
+*   Tire sizes and wheel diameters
+    
+*   Base cost
+    
+*   Unicorn flag
+    
 
-- Save changes to MAIN
-Writes changes to the MAIN SLT only.
+**Wheel diameter safety**Front and rear wheel diameters are clamped between **13 and 24**.
 
-- Reload from selected source
-Reloads original values from the source SLT (MAIN or DLC).
+**Save changes to MAIN**Writes changes only to MAIN.
 
-### Tab: Body (Data_CarBody)
+**Reload from selected source**Reloads original values from the source SLT.
 
-- Purpose
+Tab: Body (Data\_CarBody)
+-------------------------
+
+### Purpose
+
 Edit physical body parameters.
 
-Editable fields include:
-  - Wheelbase
-  - Track width
-  - Ride height (front and rear)
-  - Changes apply only to MAIN.
+Editable fields:
+
+*   Wheelbase
+    
+*   Track width
+    
+*   Ride height (front and rear)
+    
 
 Notes:
-- Cloned cars will always have a CarID of 2000 and up to avoid conflicts with DLC cars. Make sure to edit this number in case you already have cloned cars.
-- Cloned cars will have a year marker of 6969 so you can differentiate them in-game. You can change this to something else, but it's not possible to change the car name itself without creating a new string in a different file, which is out of scope for now.
 
-### Tab: Engine (Lab + Assign)
+*   Cloned cars always use CarIDs ≥ 2000
+    
+*   Default clone year marker is 6969
+    
+*   Car names cannot be changed here (string tables are out of scope)
+    
 
-- Purpose
+Tab: Engine (Lab + Assign)
+--------------------------
+
+### Purpose
+
 Manage engines and engine assignment.
 
-- Left side
-List of all engines across MAIN and DLC.
+**Left side**List of all engines across MAIN and DLC.
 
-- Search box
-Filters engines by name or MediaName.
+**Search box**Filter by EngineName or MediaName.
 
-- Assign selected engine as STOCK
-Sets the selected engine as the stock engine for the current car.
+### Buttons
 
-- Clone selected engine into MAIN + Assign
-If the engine is from DLC, it is cloned into MAIN and then assigned.
+**Assign selected engine as STOCK**Assigns the selected engine as the stock engine for the active car.
 
-- Engine editor (MAIN only)
+**Clone selected engine into MAIN + Assign**Clones the engine into MAIN if needed and assigns it safely.
+
+### Engine editor (MAIN only)
+
 Once an engine exists in MAIN, it can be edited.
 
-Editable engine fields include:
-  - Mass
-  - MediaName (dropdown)
-  - Engine configuration (dropdown)
-  - Cylinders (dropdown)
-  - Compression
-  - Variable timing (dropdown)
-  - Boost
-  - Torque and power graph limits
-  - Engine name
-  - Rotation
-  - Carbureted / Diesel / Rotary flags
+Editable fields include:
 
-- Load engine fields from MAIN
-Loads current values.
+*   Mass
+    
+*   MediaName (dropdown)
+    
+*   Engine configuration (dropdown)
+    
+*   Cylinders (dropdown)
+    
+*   Compression
+    
+*   Variable timing (dropdown)
+    
+*   Boost
+    
+*   Torque and power graph limits
+    
+*   Engine name
+    
+*   Rotation
+    
+*   Carbureted / Diesel / Rotary flags
+    
 
-- Apply engine edits to MAIN
-Writes changes to MAIN.
+**Important**Engine cloning also clones all required TorqueCurve entries.Missing torque curves will cause crashes during race load.
 
-### Tab: Upgrade Editor
+Tab: Upgrade Editor
+-------------------
 
-- Purpose
-Edit List_Upgrade* tables directly.
+### Purpose
 
-This is an advanced feature and allows full control.
+Edit List\_Upgrade\* tables directly.
 
-- Table dropdown
-Shows all List_Upgrade* tables, with shortened names for readability
-(example: EngineCamshaft instead of List_UpgradeEngineCamshaft)
+This is an advanced feature.
 
-- Load rows
-Loads rows relevant to the selected car.
+**Table dropdown**Shows all List\_Upgrade\* tables with shortened names(example: EngineCamshaft instead of List\_UpgradeEngineCamshaft)
+
+**Load rows**Loads rows relevant to the selected car.
 
 The tool automatically detects scope:
-  - Car-scoped (Ordinal / CarID)
-  - Engine-scoped (EngineID)
-  - CarBody-scoped (CarBodyID)
-  - Drivetrain-scoped (PowertrainID / DrivetrainID)
 
-- Rows list
-Shows Level and IsStock where applicable.
+*   Car-scoped (Ordinal / CarID)
+    
+*   Engine-scoped (EngineID)
+    
+*   CarBody-scoped (CarBodyID)
+    
+*   Drivetrain-scoped
+    
 
-- Field editor
-Edits all fields in the selected row.
-Dropdowns are used when lookups exist.
+**Row editor**
 
-Special handling:
-  - TireCompoundID uses friendly names
-  - EngineID shows all engines across SLTs
-  - PowertrainID shows drivetrain type + mounting direction
-  - Wheel diameter values are clamped
-  - Add row (copy selected)
-  - Duplicates the selected row and automatically assigns the correct scope value.
+*   Edit all fields
+    
+*   Dropdowns used where lookups exist
+    
+*   Add row (copy selected)
+    
+*   Delete row
+    
+*   Apply edits to MAIN
+    
 
-- Delete selected row
-Removes the selected row from MAIN.
+Supports custom upgrade levels beyond the game’s default 0–3.
 
-- Apply row edits
-Writes the edited row to MAIN.
+Tab: Constructor (experimental)
+-------------------------------
 
-This tab supports custom upgrade levels beyond the game’s default 0–3.
+### Purpose
 
-### Tab: Constructor (UNTESTED)
-
-- Purpose
-Apply subsystems from donor cars (engine, suspension, drivetrain, etc).
-
-This allows mixing components from different cars.
+Apply subsystems from donor cars.
 
 Example:
-- Engine from car A
-- Suspension from car B
-- Drivetrain from car C
 
-This tab uses safe cloning rules and base-block remapping.
+*   Engine from car A
+    
+*   Suspension from car B
+    
+*   Drivetrain from car C
+    
 
-## Safety notes
+Uses safe cloning and base-block remapping.This tab is still under heavy testing.
 
-- Always back up MAIN before major changes
-- Avoid editing global Combo_* tables
-- Do not assign multiple stock engines or drivetrains to a car
-- The tool enforces these rules where possible
+Safety notes
+------------
 
-## Build notes
+*   Always back up MAIN before major changes
+    
+*   Avoid manual edits to global Combo\_\* tables
+    
+*   Never assign multiple stock engines or drivetrains to a car
+    
+*   Missing TorqueCurves or mismatched Combo tables will crash the game
+    
 
-- This is a Windows-only tool.
+Build notes
+-----------
 
-### Recommended build:
+*   Windows only
+    
+*   Python 3.10+
+    
+*   PyInstaller recommended
+    
 
-Python 3.10+
-PyInstaller
+If distributing builds, distribute the EXE only.
 
-If you distribute builds, distribute the EXE only.
-The source contains no personal data or identifying information.
+Status
+------
 
-## Status
+Under active development.
 
-This tool is under active development.
 If something breaks:
-- Restore from backup
-- Reload sources
-- Rebuild lookup cache
+
+*   Restore from backup
+    
+*   Reload sources
+    
+*   Rebuild lookup cache
+    
 
 ### Disclaimer
-This project is not affiliated with Turn 10 Studios or Microsoft. For educational and modding purposes only.
+
+This project is not affiliated with Turn 10 Studios or Microsoft.For educational and offline modding purposes only.
