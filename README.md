@@ -4,7 +4,7 @@ Forza Car Editor
 Overview
 --------
 
-**Forza Constructor Studio** is a Windows tool for editing and extending car data in _Forza Motorsport 4_ (Xbox 360).
+**Forza Car Editor** is a Windows tool for editing and extending car data in _Forza Motorsport 4_ (Xbox 360).
 
 It allows you to safely inspect, clone, and modify cars, engines, and upgrade data stored in the game’s SLT (SQLite) databases, while respecting how the game expects runtime data to be structured.
 
