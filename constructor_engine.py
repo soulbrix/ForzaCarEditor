@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-CONSTRUCTOR_VERSION = "v0.1.1"
+CONSTRUCTOR_VERSION = "v0.2.1"
 
 
 @dataclass
@@ -34,6 +34,20 @@ def _list_tables(cur: sqlite3.Cursor) -> List[str]:
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
     return [r[0] for r in cur.fetchall()]
 
+def _pick_existing_table(cur: sqlite3.Cursor, candidates: List[str]) -> Optional[str]:
+    """
+    Return the first table name that exists in the DB, matching case-insensitively.
+    Example: candidates ["Data_Engine", "Data_engine"].
+    """
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    existing = [r[0] for r in cur.fetchall()]
+    lower_map = {name.lower(): name for name in existing}
+    for c in candidates:
+        if c in existing:
+            return c
+        if c.lower() in lower_map:
+            return lower_map[c.lower()]
+    return None
 
 def _table_info(cur: sqlite3.Cursor, table: str):
     cur.execute(f"PRAGMA table_info('{table}')")
@@ -1051,7 +1065,8 @@ def set_stock_engine_for_car(main_db: Path, car_id: int, engine_id: int) -> None
             row[isstock_col] = 1
             row[level_col] = 0
 
-            cols_ins = [c for c in cols if c in row]
+            # Do NOT insert primary key columns (they are UNIQUE and will collide)
+            cols_ins = [c for c in cols if c in row and c not in ("Id", "ID")]
             vals_ins = [row[c] for c in cols_ins]
 
             cols_sql = ",".join(f'"{c}"' for c in cols_ins)

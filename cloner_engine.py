@@ -4,9 +4,17 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Iterable
 
-ENGINE_VERSION = "v0.13.3"
+ENGINE_VERSION = "v0.2.1"
+
+# NOTE:
+# - This engine is intentionally conservative. It reads from MAIN + optional DLC SLTs,
+#   but it only WRITES to MAIN.
+# - Car cloning: clones Data_Car + Data_CarBody base block + all List_Upgrade* rows (car-scoped)
+#   + any other tables with Ordinal/CarID scoped rows, with base-block ID rewrites.
+# - Engine cloning: conservative by default (Data_Engine + List_Upgrade* rows referencing EngineID),
+#   avoids global Combo_* tables that tend to have UNIQUE constraints.
 
 
 @dataclass
@@ -28,8 +36,17 @@ class CloneReport:
 # Low-level DB helpers
 # -----------------------------
 
-def _connect(db: Path) -> sqlite3.Connection:
-    con = sqlite3.connect(str(db))
+def _connect(db: Path, readonly: bool = False) -> sqlite3.Connection:
+    """SQLite connect helper with safety: never create new DB files."""
+    db = Path(db)
+    if not db.exists():
+        raise FileNotFoundError(f"DB not found: {db}")
+
+    if readonly:
+        uri_path = db.resolve().as_posix()
+        con = sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True)
+    else:
+        con = sqlite3.connect(str(db))
     con.row_factory = sqlite3.Row
     return con
 
@@ -39,12 +56,20 @@ def _list_tables(cur: sqlite3.Cursor) -> List[str]:
     return [r[0] for r in cur.fetchall()]
 
 
-def _table_info(cur: sqlite3.Cursor, table: str):
+def _table_exists(cur: sqlite3.Cursor, table: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? AND name NOT LIKE 'sqlite_%' LIMIT 1",
+        (table,),
+    )
+    return cur.fetchone() is not None
+
+
+def _table_info(cur: sqlite3.Cursor, table: str) -> List[sqlite3.Row]:
     cur.execute(f"PRAGMA table_info('{table}')")
-    return cur.fetchall()  # cid, name, type, notnull, dflt_value, pk
+    return cur.fetchall()
 
 
-def _cols(info) -> List[str]:
+def _cols(info: List[sqlite3.Row]) -> List[str]:
     return [r[1] for r in info]
 
 
@@ -55,72 +80,66 @@ def _safe_int(x) -> Optional[int]:
         return None
 
 
-def _has_single_integer_pk_id(info) -> bool:
-    pk_cols = [r[1] for r in info if r[5]]
+def _has_single_integer_pk_id(info: List[sqlite3.Row]) -> bool:
+    """True if table has exactly one PK column named Id (case-sensitive) of type INTEGER."""
+    pk_cols = [r for r in info if r[5]]
     if len(pk_cols) != 1:
         return False
-    pk = pk_cols[0]
-    if pk.lower() != "id":
-        return False
-    for cid, name, typ, notnull, dflt, pkflag in info:
-        if pkflag and name == pk:
-            return (typ or "").strip().upper() == "INTEGER"
-    return False
+    cid, name, typ, notnull, dflt, pkflag = pk_cols[0]
+    return name == "Id" and (typ or "").strip().upper() == "INTEGER"
 
 
-def _table_exists(cur: sqlite3.Cursor, name: str) -> bool:
-    return name in set(_list_tables(cur))
+def _insert_row(cur: sqlite3.Cursor, table: str, cols: List[str], vals: List[Any], auto_drop_id: bool = True) -> None:
+    """
+    Insert row, optionally dropping Id if it's a single INTEGER PRIMARY KEY (autoinc-ish).
+    """
+    info = _table_info(cur, table)
+    cols_t = _cols(info)
 
+    if auto_drop_id and "Id" in cols and _has_single_integer_pk_id(info) and table not in {"Data_Car", "Data_CarBody", "Data_Engine"}:
+        i = cols.index("Id")
+        cols = cols[:i] + cols[i + 1 :]
+        vals = vals[:i] + vals[i + 1 :]
 
-def _insert_row(
-    cur_t: sqlite3.Cursor,
-    table: str,
-    cols_t: List[str],
-    vals_t: List,
-    auto_pk: bool,
-):
-    preserve_id_tables = {"Data_Car", "Data_CarBody", "Data_Engine"}
+    # Only keep columns that exist in target table
+    cols2, vals2 = [], []
+    for c, v in zip(cols, vals):
+        if c in cols_t:
+            cols2.append(c)
+            vals2.append(v)
 
-    if auto_pk and "Id" in cols_t and table not in preserve_id_tables:
-        i = cols_t.index("Id")
-        cols_t = cols_t[:i] + cols_t[i + 1:]
-        vals_t = vals_t[:i] + vals_t[i + 1:]
-
-    placeholders = ",".join(["?"] * len(cols_t))
-    cols_sql = ",".join([f'"{c}"' for c in cols_t])
-    cur_t.execute(f'INSERT INTO "{table}" ({cols_sql}) VALUES ({placeholders})', vals_t)
+    placeholders = ",".join(["?"] * len(cols2))
+    cols_sql = ",".join([f'"{c}"' for c in cols2])
+    cur.execute(f'INSERT INTO "{table}" ({cols_sql}) VALUES ({placeholders})', vals2)
 
 
 def _row_to_target_shape(
-    source_cols: List[str],
-    source_row: sqlite3.Row,
-    target_cols: List[str],
-    rewrites: Dict[str, Any],
-    old_base: int,
-    new_base: int,
-    rewrite_base_ids: bool,
-) -> Tuple[List[str], List]:
-    src_map = {c: source_row[c] for c in source_cols if c in source_row.keys()}
-    insert_cols = [c for c in target_cols if c in src_map]
-    insert_vals = [src_map[c] for c in insert_cols]
+    src_row: sqlite3.Row,
+    src_cols: List[str],
+    tgt_cols: List[str],
+) -> Tuple[List[str], List[Any]]:
+    src_map = {c: src_row[c] for c in src_cols if c in src_row.keys()}
+    ins_cols = [c for c in tgt_cols if c in src_map]
+    ins_vals = [src_map[c] for c in ins_cols]
+    return ins_cols, ins_vals
 
-    for c, v in rewrites.items():
-        if c in insert_cols:
-            insert_vals[insert_cols.index(c)] = v
 
-    if rewrite_base_ids:
-        for i, c in enumerate(insert_cols):
-            if c == "Ordinal":
-                continue
-            if not (c.lower().endswith("id") or c.lower().endswith("ids")):
-                continue
-            vi = _safe_int(insert_vals[i])
-            if vi is None:
-                continue
-            if old_base <= vi < old_base + 1000:
-                insert_vals[i] = new_base + (vi - old_base)
-
-    return insert_cols, insert_vals
+def _rewrite_base_ids_in_place(cols: List[str], vals: List[Any], old_base: int, new_base: int) -> None:
+    """
+    For any *ID/*Ids column (except Ordinal/CarID/EngineID etc), if value is in old_base..old_base+999,
+    shift to new_base + offset.
+    """
+    for i, c in enumerate(cols):
+        cl = c.lower()
+        if c in ("Ordinal", "CarID", "CarId", "EngineID", "EngineId", "Engine", "ContentID", "OfferID"):
+            continue
+        if not (cl.endswith("id") or cl.endswith("ids")):
+            continue
+        vi = _safe_int(vals[i])
+        if vi is None:
+            continue
+        if old_base <= vi < old_base + 1000:
+            vals[i] = new_base + (vi - old_base)
 
 
 def _clone_rows_from_multiple_sources(
@@ -133,699 +152,253 @@ def _clone_rows_from_multiple_sources(
     old_base: int,
     new_base: int,
     rewrite_base_ids: bool,
+    delete_existing_for_target: Optional[Tuple[str, int]] = None,
+    extra_where_sql: str = "",
 ) -> int:
-    target_tables = set(_list_tables(cur_t))
-    if table not in target_tables:
+    """
+    Clones rows from ALL sources (MAIN + DLC etc), de-duping identical rows.
+    This matches the behavior of the stable cloner and prevents missing deps.
+
+    delete_existing_for_target: (col_name, value) => delete rows in target before insert
+    extra_where_sql: appended to WHERE clause
+    """
+    if not _table_exists(cur_t, table):
         return 0
 
     info_t = _table_info(cur_t, table)
     cols_t = _cols(info_t)
-    auto_pk = _has_single_integer_pk_id(info_t)
 
-    inserted = 0
-    seen: set[Tuple[str, Tuple[Any, ...]]] = set()
+    # delete existing (avoid duplicates)
+    if delete_existing_for_target:
+        dcol, dval = delete_existing_for_target
+        if dcol in cols_t:
+            cur_t.execute(f'DELETE FROM "{table}" WHERE "{dcol}"=?', (dval,))
+
+    total = 0
+    seen: set[Tuple[Any, ...]] = set()
 
     for cur_s in cursors_s:
-        source_tables = set(_list_tables(cur_s))
-        if table not in source_tables:
+        if not _table_exists(cur_s, table):
             continue
-
         info_s = _table_info(cur_s, table)
         cols_s = _cols(info_s)
         if where_col not in cols_s:
             continue
 
-        cur_s.execute(f'SELECT * FROM "{table}" WHERE "{where_col}"=?', (where_val,))
+        cur_s.execute(
+            f'SELECT * FROM "{table}" WHERE "{where_col}"=?{extra_where_sql}',
+            (where_val,),
+        )
         rows = cur_s.fetchall()
-
-        for r in rows:
-            insert_cols, insert_vals = _row_to_target_shape(
-                cols_s, r, cols_t, rewrites, old_base, new_base, rewrite_base_ids
-            )
-            if not insert_cols:
-                continue
-
-            sig = (",".join(insert_cols), tuple(insert_vals))
-            if sig in seen:
-                continue
-            seen.add(sig)
-
-            _insert_row(cur_t, table, insert_cols, insert_vals, auto_pk=auto_pk)
-            inserted += 1
-
-    return inserted
-
-
-# -----------------------------
-# CarBody discovery + allocation
-# -----------------------------
-
-def _discover_carbody_ref_column(cur: sqlite3.Cursor) -> Optional[str]:
-    tables = set(_list_tables(cur))
-    if "Data_Car" not in tables:
-        return None
-    cols = _cols(_table_info(cur, "Data_Car"))
-
-    candidates = [
-        "CarBodyID", "CarBodyId", "CarbodyId", "CarBody",
-        "BodyID", "BodyId",
-        "CarBodyDataID", "CarBodyDataId",
-        "Data_CarBodyID", "Data_CarBodyId",
-        "CarModelID", "CarModelId",
-    ]
-    for c in candidates:
-        if c in cols:
-            return c
-    return None
-
-
-def get_car_body_id(db_path: Path, car_id: int) -> int:
-    con = _connect(db_path)
-    cur = con.cursor()
-
-    ref_col = _discover_carbody_ref_column(cur)
-    body_id = None
-    if ref_col:
-        try:
-            cur.execute(f'SELECT "{ref_col}" AS bid FROM "Data_Car" WHERE "Id"=?', (car_id,))
-            r = cur.fetchone()
-            if r:
-                body_id = _safe_int(r["bid"])
-        except Exception:
-            body_id = None
-
-    con.close()
-    return body_id if body_id is not None else (car_id * 1000)
-
-
-def _find_free_body_id_in_block(cur_t: sqlite3.Cursor, start: int, block: int = 1000) -> int:
-    if "Data_CarBody" not in set(_list_tables(cur_t)):
-        return start
-    for cand in range(start, start + block):
-        cur_t.execute('SELECT 1 FROM "Data_CarBody" WHERE "Id"=? LIMIT 1', (cand,))
-        if not cur_t.fetchone():
-            return cand
-    return start + block
-
-
-# -----------------------------
-# Cars: listing + cloning
-# -----------------------------
-
-def suggest_next_car_id(db_path: Path, min_id: int = 2000) -> int:
-    con = _connect(db_path)
-    cur = con.cursor()
-    cur.execute("SELECT MAX(Id) AS mx FROM Data_Car")
-    mx = int(cur.fetchone()["mx"] or 0)
-    con.close()
-    return max(min_id, mx + 1)
-
-
-def list_cars(db_path: Path) -> List[Tuple[int, int, str]]:
-    con = _connect(db_path)
-    cur = con.cursor()
-    cur.execute('SELECT Id, Year, MediaName FROM Data_Car ORDER BY Id')
-    rows = cur.fetchall()
-    con.close()
-
-    out: List[Tuple[int, int, str]] = []
-    for r in rows:
-        cid = int(r["Id"])
-        year = int(r["Year"] or 0)
-        media = r["MediaName"] if r["MediaName"] else "(no MediaName)"
-        out.append((cid, year, str(media)))
-    return out
-    
-def _clone_stock_rows_only_from_multiple_sources(
-    cursors_s: List[sqlite3.Cursor],
-    cur_t: sqlite3.Cursor,
-    table: str,
-    where_col: str,
-    where_val: int,
-    rewrites: Dict[str, Any],
-) -> int:
-    """
-    Clone ONLY stock rows (Level=0 and IsStock=1) from `table` for where_col=where_val.
-    If Level/IsStock columns don't exist, we fallback to cloning all rows (still with rewrites).
-    """
-    target_tables = set(_list_tables(cur_t))
-    if table not in target_tables:
-        return 0
-
-    info_t = _table_info(cur_t, table)
-    cols_t = _cols(info_t)
-    auto_pk = _has_single_integer_pk_id(info_t)
-
-    inserted = 0
-    seen: set[Tuple[str, Tuple[Any, ...]]] = set()
-
-    # Build filter clause depending on available columns
-    def _stock_filter(cols: List[str]) -> tuple[str, tuple]:
-        has_level = "Level" in cols
-        has_isstock = "IsStock" in cols
-        if has_level and has_isstock:
-            return ' AND "Level"=0 AND "IsStock"=1', tuple()
-        if has_level:
-            return ' AND "Level"=0', tuple()
-        if has_isstock:
-            return ' AND "IsStock"=1', tuple()
-        return "", tuple()
-
-    for cur_s in cursors_s:
-        source_tables = set(_list_tables(cur_s))
-        if table not in source_tables:
+        if not rows:
             continue
 
-        info_s = _table_info(cur_s, table)
-        cols_s = _cols(info_s)
-        if where_col not in cols_s:
-            continue
-
-        extra_where, _ = _stock_filter(cols_s)
-        sql = f'SELECT * FROM "{table}" WHERE "{where_col}"=?{extra_where}'
-        cur_s.execute(sql, (where_val,))
-        rows = cur_s.fetchall()
-
         for r in rows:
-            src_cols = cols_s
-            src_map = {c: r[c] for c in src_cols if c in r.keys()}
+            ins_cols, ins_vals = _row_to_target_shape(r, cols_s, cols_t)
 
-            insert_cols = [c for c in cols_t if c in src_map]
-            insert_vals = [src_map[c] for c in insert_cols]
-
-            # Apply rewrites
+            # apply explicit rewrites
             for c, v in rewrites.items():
-                if c in insert_cols:
-                    insert_vals[insert_cols.index(c)] = v
+                if c in ins_cols:
+                    ins_vals[ins_cols.index(c)] = v
+                else:
+                    if c in cols_t:
+                        ins_cols.append(c)
+                        ins_vals.append(v)
 
-            if not insert_cols:
+            if rewrite_base_ids:
+                _rewrite_base_ids_in_place(ins_cols, ins_vals, old_base, new_base)
+
+            # De-dupe signature (values aligned to target column order)
+            sig = []
+            for c in cols_t:
+                if c in ins_cols:
+                    sig.append(ins_vals[ins_cols.index(c)])
+                else:
+                    sig.append(None)
+            sig_t = tuple(sig)
+            if sig_t in seen:
                 continue
+            seen.add(sig_t)
 
-            sig = (",".join(insert_cols), tuple(insert_vals))
-            if sig in seen:
-                continue
-            seen.add(sig)
+            _insert_row(cur_t, table, ins_cols, ins_vals, auto_drop_id=True)
+            total += 1
 
-            _insert_row(cur_t, table, insert_cols, insert_vals, auto_pk=auto_pk)
-            inserted += 1
+    return total
 
-    return inserted
-
-def clone_car_between(
-    source_db: Path,
-    target_db: Path,
-    source_car_id: int,
-    new_car_id: int,
-    year_marker: int = 6969,
-    extra_source_db: Optional[Path] = None,
-) -> CloneReport:
-    old_base = source_car_id * 1000
-    new_base = new_car_id * 1000
-
-    con_s = _connect(source_db)
-    con_t = _connect(target_db)
-    cur_s = con_s.cursor()
-    cur_t = con_t.cursor()
-
-    con_x = None
-    cur_x = None
-    if extra_source_db is not None:
-        con_x = _connect(extra_source_db)
-        cur_x = con_x.cursor()
-
-    touched: Dict[str, int] = {}
-
-    def touch(t: str, n: int):
-        if n:
-            touched[t] = touched.get(t, 0) + n
-
-    cur_s.execute('SELECT COUNT(*) AS c FROM Data_Car WHERE Id=?', (source_car_id,))
-    if int(cur_s.fetchone()["c"] or 0) == 0:
-        con_s.close()
-        con_t.close()
-        if con_x:
-            con_x.close()
-        raise ValueError(f"Source car {source_car_id} not found in {source_db.name}")
-
-    cur_t.execute('SELECT COUNT(*) AS c FROM Data_Car WHERE Id=?', (new_car_id,))
-    if int(cur_t.fetchone()["c"] or 0) != 0:
-        con_s.close()
-        con_t.close()
-        if con_x:
-            con_x.close()
-        raise ValueError(f"Target already contains CarID {new_car_id}. Pick another.")
-
-    source_body_id = get_car_body_id(source_db, source_car_id)
-
-    if old_base <= source_body_id < old_base + 1000:
-        desired_new_body_id = new_base + (source_body_id - old_base)
-    else:
-        desired_new_body_id = new_base
-    new_body_id = _find_free_body_id_in_block(cur_t, desired_new_body_id, block=1000)
-
-    aux_sources: List[sqlite3.Cursor] = [cur_s]
-    if cur_x is not None:
-        aux_sources.append(cur_x)
-
-    ref_col_t = _discover_carbody_ref_column(cur_t)
-    rew_car: Dict[str, Any] = {"Id": new_car_id, "Year": year_marker}
-    if ref_col_t:
-        rew_car[ref_col_t] = new_body_id
-
-    touch("Data_Car", _clone_rows_from_multiple_sources(
-        cursors_s=[cur_s],
-        cur_t=cur_t,
-        table="Data_Car",
-        where_col="Id",
-        where_val=source_car_id,
-        rewrites=rew_car,
-        old_base=old_base,
-        new_base=new_base,
-        rewrite_base_ids=False
-    ))
-
-    body_inserted = _clone_rows_from_multiple_sources(
-        cursors_s=aux_sources,
-        cur_t=cur_t,
-        table="Data_CarBody",
-        where_col="Id",
-        where_val=source_body_id,
-        rewrites={"Id": new_body_id},
-        old_base=old_base,
-        new_base=new_base,
-        rewrite_base_ids=False
-    )
-    touch("Data_CarBody", body_inserted)
-
-    if body_inserted == 0:
-        con_s.close()
-        con_t.close()
-        if con_x:
-            con_x.close()
-        raise ValueError(
-            f"Missing Data_CarBody.Id={source_body_id} in source/extra sources. "
-            "This clone will be blank/crash. Ensure the SLT containing this car also contains its body row."
-        )
-
-    target_tables = set(_list_tables(cur_t))
-    all_tables = sorted(target_tables)
-
-    body_cols = ["CarBodyID", "CarBodyId", "CarbodyId"]
-    # We'll handle List_UpgradeCarBody explicitly (stock row only) to avoid cockpit camera issues.
-    upgrade_tables = [
-        t for t in all_tables
-        if t.lower().startswith("list_upgrade") and t.lower() != "list_upgradecarbody"
-]
-
-
-    for t in upgrade_tables:
-        cols_t = _cols(_table_info(cur_t, t))
-        if "Ordinal" in cols_t:
-            rew: Dict[str, Any] = {"Ordinal": new_car_id}
-            for bc in body_cols:
-                if bc in cols_t:
-                    rew[bc] = new_body_id
-
-            n = _clone_rows_from_multiple_sources(
-                cursors_s=aux_sources,
-                cur_t=cur_t,
-                table=t,
-                where_col="Ordinal",
-                where_val=source_car_id,
-                rewrites=rew,
-                old_base=old_base,
-                new_base=new_base,
-                rewrite_base_ids=True
-            )
-            touch(t, n)
-        else:
-            bc = next((c for c in body_cols if c in cols_t), None)
-            if bc:
-                n = _clone_rows_from_multiple_sources(
-                    cursors_s=aux_sources,
-                    cur_t=cur_t,
-                    table=t,
-                    where_col=bc,
-                    where_val=source_body_id,
-                    rewrites={bc: new_body_id},
-                    old_base=old_base,
-                    new_base=new_base,
-                    rewrite_base_ids=True
-                )
-                touch(t, n)
-                
-            # --- Special case: List_UpgradeCarBody (stock row only) ---
-    if "List_UpgradeCarBody" in target_tables:
-        cols_ucb_t = _cols(_table_info(cur_t, "List_UpgradeCarBody"))
-
-        # Identify key columns
-        ordinal_col = "Ordinal" if "Ordinal" in cols_ucb_t else ("CarId" if "CarId" in cols_ucb_t else ("CarID" if "CarID" in cols_ucb_t else None))
-        if ordinal_col:
-            # Always wipe any existing rows for the new car first (prevents duplicates / cockpit issues)
-            cur_t.execute(f'DELETE FROM "List_UpgradeCarBody" WHERE "{ordinal_col}"=?', (new_car_id,))
-
-            # We must also force the body ID column if it exists
-            body_col = None
-            for bc in ["CarBodyID", "CarBodyId", "CarbodyId"]:
-                if bc in cols_ucb_t:
-                    body_col = bc
-                    break
-
-            rew_ucb = {ordinal_col: new_car_id}
-            if body_col:
-                rew_ucb[body_col] = new_body_id
-
-            # Clone ONLY stock row(s) from donor -> clone
-            n_ucb = _clone_stock_rows_only_from_multiple_sources(
-                cursors_s=aux_sources,
-                cur_t=cur_t,
-                table="List_UpgradeCarBody",
-                where_col=ordinal_col,
-                where_val=source_car_id,
-                rewrites=rew_ucb,
-            )
-            touch("List_UpgradeCarBody", n_ucb)
-
-
-    def _is_baseblock_ordinal_table(table: str) -> bool:
-        cols_t = _cols(_table_info(cur_t, table))
-        if "Ordinal" not in cols_t:
-            return False
-        id_cols = [c for c in cols_t if c != "Ordinal" and (c.lower().endswith("id") or c.lower().endswith("ids"))]
-        if not id_cols:
-            return False
-
-        for cur_src in aux_sources:
-            if table not in set(_list_tables(cur_src)):
-                continue
-            cols_s = _cols(_table_info(cur_src, table))
-            if "Ordinal" not in cols_s:
-                continue
-            for c in id_cols[:6]:
-                if c not in cols_s:
-                    continue
-                cur_src.execute(f'SELECT "{c}" AS v FROM "{table}" WHERE "Ordinal"=? LIMIT 80', (source_car_id,))
-                for rr in cur_src.fetchall():
-                    vi = _safe_int(rr["v"])
-                    if vi is not None and old_base <= vi < old_base + 1000:
-                        return True
-        return False
-
-    ordinal_tables = [
-        t for t in all_tables
-        if not t.lower().startswith("list_upgrade") and _is_baseblock_ordinal_table(t)
-    ]
-
-    for t in ordinal_tables:
-        cols_t = _cols(_table_info(cur_t, t))
-        rew: Dict[str, Any] = {"Ordinal": new_car_id}
-        for bc in body_cols:
-            if bc in cols_t:
-                rew[bc] = new_body_id
-
-        n = _clone_rows_from_multiple_sources(
-            cursors_s=aux_sources,
-            cur_t=cur_t,
-            table=t,
-            where_col="Ordinal",
-            where_val=source_car_id,
-            rewrites=rew,
-            old_base=old_base,
-            new_base=new_base,
-            rewrite_base_ids=True
-        )
-        touch(t, n)
-
-    for t in all_tables:
-        if t.lower().startswith("list_upgrade"):
-            continue
-        cols_t = _cols(_table_info(cur_t, t))
-        bc = next((c for c in body_cols if c in cols_t), None)
-        if not bc:
-            continue
-        n = _clone_rows_from_multiple_sources(
-            cursors_s=aux_sources,
-            cur_t=cur_t,
-            table=t,
-            where_col=bc,
-            where_val=source_body_id,
-            rewrites={bc: new_body_id},
-            old_base=old_base,
-            new_base=new_base,
-            rewrite_base_ids=True
-        )
-        touch(t, n)
-
-    for t in all_tables:
-        cols_t = _cols(_table_info(cur_t, t))
-        if "CarId" in cols_t:
-            n = _clone_rows_from_multiple_sources(
-                cursors_s=aux_sources,
-                cur_t=cur_t,
-                table=t,
-                where_col="CarId",
-                where_val=source_car_id,
-                rewrites={"CarId": new_car_id},
-                old_base=old_base,
-                new_base=new_base,
-                rewrite_base_ids=False
-            )
-            touch(t, n)
-        if "CarID" in cols_t:
-            n = _clone_rows_from_multiple_sources(
-                cursors_s=aux_sources,
-                cur_t=cur_t,
-                table=t,
-                where_col="CarID",
-                where_val=source_car_id,
-                rewrites={"CarID": new_car_id},
-                old_base=old_base,
-                new_base=new_base,
-                rewrite_base_ids=False
-            )
-            touch(t, n)
-
-    con_t.commit()
-    con_s.close()
-    con_t.close()
-    if con_x:
-        con_x.close()
-
-    return CloneReport(
-        source_db=source_db,
-        target_db=target_db,
-        extra_source_db=extra_source_db,
-        source_car_id=source_car_id,
-        new_car_id=new_car_id,
-        year_marker=year_marker,
-        source_body_id=source_body_id,
-        new_body_id=new_body_id,
-        old_base=old_base,
-        new_base=new_base,
-        tables_touched=dict(sorted(touched.items(), key=lambda kv: (-kv[1], kv[0]))),
-    )
 
 
 # -----------------------------
-# Engine discovery + assignment
+# Car ID / Engine ID suggestions
 # -----------------------------
 
-def list_engines_across_sources(source_paths: List[Path]) -> List[Tuple[int, str, Path]]:
-    engines: Dict[int, Tuple[str, Path]] = {}
-    preferred_label_cols = ["EngineName", "MediaName", "Name", "DisplayName", "StringKey", "StringID", "Description"]
-
-    for p in source_paths:
-        try:
-            con = _connect(p)
-            cur = con.cursor()
-            tables = set(_list_tables(cur))
-            if "Data_Engine" not in tables:
-                con.close()
-                continue
-
-            info = _table_info(cur, "Data_Engine")
-            cols = _cols(info)
-
-            id_col = "Id" if "Id" in cols else ("EngineID" if "EngineID" in cols else ("EngineId" if "EngineId" in cols else None))
-            if not id_col:
-                con.close()
-                continue
-
-            label_col = next((c for c in preferred_label_cols if c in cols), None)
-
-            if label_col:
-                cur.execute(f'SELECT "{id_col}" AS eid, "{label_col}" AS lbl FROM "Data_Engine"')
-            else:
-                cur.execute(f'SELECT "{id_col}" AS eid FROM "Data_Engine"')
-
-            for r in cur.fetchall():
-                eid = _safe_int(r["eid"])
-                if eid is None or eid in engines:
-                    continue
-                lbl = r["lbl"] if (label_col and "lbl" in r.keys()) else None
-                label = str(lbl) if lbl not in (None, "") else f"Engine {eid}"
-                engines[eid] = (label, p)
-
-            con.close()
-        except Exception:
-            try:
-                con.close()
-            except Exception:
-                pass
-            continue
-
-    out = [(eid, engines[eid][0], engines[eid][1]) for eid in engines.keys()]
-    out.sort(key=lambda x: (x[1].lower(), x[0]))
-    return out
+def _max_int_in_column(cur: sqlite3.Cursor, table: str, col: str) -> Optional[int]:
+    if not _table_exists(cur, table):
+        return None
+    cols = _cols(_table_info(cur, table))
+    if col not in cols:
+        return None
+    cur.execute(f'SELECT MAX(CAST("{col}" AS INTEGER)) AS m FROM "{table}"')
+    r = cur.fetchone()
+    if not r or r["m"] is None:
+        return None
+    try:
+        return int(r["m"])
+    except Exception:
+        return None
 
 
-def list_engine_medianames_across_sources(source_paths: List[Path]) -> List[Tuple[str, Path]]:
-    out: Dict[str, Path] = {}
-
-    for p in source_paths:
-        try:
-            con = _connect(p)
-            cur = con.cursor()
-            tables = set(_list_tables(cur))
-            if "Data_Engine" not in tables:
-                con.close()
-                continue
-
-            cols = _cols(_table_info(cur, "Data_Engine"))
-            if "MediaName" not in cols:
-                con.close()
-                continue
-
-            cur.execute('SELECT "MediaName" AS mn FROM "Data_Engine"')
-            for r in cur.fetchall():
-                mn = r["mn"]
-                if mn is None:
-                    continue
-                mn = str(mn).strip()
-                if not mn:
-                    continue
-                if mn not in out:
-                    out[mn] = p
-
-            con.close()
-        except Exception:
-            try:
-                con.close()
-            except Exception:
-                pass
-            continue
-
-    items = [(mn, out[mn]) for mn in out.keys()]
-    items.sort(key=lambda x: x[0].lower())
-    return items
-
-
-def set_stock_engine(main_db: Path, car_id: int, engine_id: int) -> int:
-    con = _connect(main_db)
-    cur = con.cursor()
-    tables = set(_list_tables(cur))
-    if "List_UpgradeEngine" not in tables:
-        con.close()
-        raise ValueError("MAIN is missing List_UpgradeEngine table.")
-
-    info = _table_info(cur, "List_UpgradeEngine")
-    cols = _cols(info)
-
-    for c in ["Ordinal", "IsStock", "Level"]:
-        if c not in cols:
-            con.close()
-            raise ValueError(f'List_UpgradeEngine is missing required column "{c}".')
-
-    engine_id_candidates = ["EngineID", "EngineId", "Engine", "EngineDataID", "Data_EngineID"]
-    eng_col = next((c for c in engine_id_candidates if c in cols), None)
-    if not eng_col:
-        con.close()
-        raise ValueError("Could not find an engine id column in List_UpgradeEngine (e.g., EngineID).")
-
-    cur.execute(
-        'SELECT COUNT(*) AS c FROM "List_UpgradeEngine" '
-        'WHERE "Ordinal"=? AND "IsStock"=1 AND "Level"=0',
-        (car_id,)
-    )
-    count = int(cur.fetchone()["c"] or 0)
-    if count == 0:
-        con.close()
-        raise ValueError(
-            f"No stock engine row found for CarID {car_id} "
-            f'(expected Ordinal={car_id}, IsStock=1, Level=0).'
-        )
-
-    cur.execute(
-        f'UPDATE "List_UpgradeEngine" SET "{eng_col}"=? '
-        f'WHERE "Ordinal"=? AND "IsStock"=1 AND "Level"=0',
-        (engine_id, car_id)
-    )
-    updated = cur.rowcount
-
-    con.commit()
-    con.close()
-    return updated
-
-
-# -----------------------------
-# Engine creator: clone + edit
-# -----------------------------
-
-# -----------------------------
-# Engine creator: clone + edit
-# -----------------------------
-
-def suggest_next_engine_id(main_db: Path, min_id: int = 2000, aux_sources: Optional[List[Path]] = None) -> int:
+def suggest_next_car_id(main_db: Path, min_id: int = 2000, aux_sources: Optional[List[Path]] = None) -> int:
     """
-    Suggest next safe EngineID >= min_id.
-    Scans MAIN + optional auxiliary sources (DLC SLTs) to avoid collisions.
-    aux_sources should be a list of Paths to SLT files (same style as self.sources in app.py).
+    Suggests the next available CarID by scanning MAIN and optional auxiliary SLTs (DLC).
     """
-    def _scan_db(db_path: Path) -> int:
-        con = _connect(db_path)
-        cur = con.cursor()
-        tables = set(_list_tables(cur))
-        if "Data_Engine" not in tables:
-            con.close()
-            return 0
+    con_m = _connect(main_db, readonly=True)
+    cur_m = con_m.cursor()
 
-        cols = _cols(_table_info(cur, "Data_Engine"))
-        id_col = (
-            "Id" if "Id" in cols else
-            "EngineID" if "EngineID" in cols else
-            "EngineId" if "EngineId" in cols else
-            None
-        )
-        if not id_col:
-            con.close()
-            return 0
-
-        cur.execute(f'SELECT MAX("{id_col}") AS mx FROM "Data_Engine"')
-        mx = cur.fetchone()["mx"]
-        con.close()
-        return int(mx) if mx is not None else 0
-
-    max_id = _scan_db(main_db)
+    max_id = _max_int_in_column(cur_m, "Data_Car", "Id") or 0
 
     if aux_sources:
         for p in aux_sources:
-            if not p:
+            try:
+                con = _connect(Path(p), readonly=True)
+                cur = con.cursor()
+                max_id = max(max_id, _max_int_in_column(cur, "Data_Car", "Id") or 0)
+                con.close()
+            except Exception:
                 continue
-            pp = Path(p)
-            # avoid double-scanning MAIN if it's included
-            if pp.resolve() == Path(main_db).resolve():
-                continue
-            max_id = max(max_id, _scan_db(pp))
 
+    con_m.close()
     return max(min_id, max_id + 1)
 
-def _insert_row_preserve_id(cur_t: sqlite3.Cursor, table: str, cols_t: List[str], vals_t: List):
-    placeholders = ",".join(["?"] * len(cols_t))
-    cols_sql = ",".join([f'"{c}"' for c in cols_t])
-    cur_t.execute(f'INSERT INTO "{table}" ({cols_sql}) VALUES ({placeholders})', vals_t)
+
+def suggest_next_engine_id(main_db: Path, min_id: int = 2000, aux_sources: Optional[List[Path]] = None) -> int:
+    con_m = _connect(main_db, readonly=True)
+    cur_m = con_m.cursor()
+    max_id = _max_int_in_column(cur_m, "Data_Engine", "Id") or _max_int_in_column(cur_m, "Data_Engine", "EngineID") or 0
+
+    if aux_sources:
+        for p in aux_sources:
+            try:
+                con = _connect(Path(p), readonly=True)
+                cur = con.cursor()
+                max_id = max(max_id,
+                             _max_int_in_column(cur, "Data_Engine", "Id") or _max_int_in_column(cur, "Data_Engine", "EngineID") or 0)
+                con.close()
+            except Exception:
+                continue
+
+    con_m.close()
+    return max(min_id, max_id + 1)
 
 
-def _clone_rows_preserve_id(
+# -----------------------------
+# Car cloning
+# -----------------------------
+
+# -----------------------------
+# Combo_* scoped cloning helpers
+# -----------------------------
+
+def _max_int(cur: sqlite3.Cursor, table: str, col: str) -> int:
+    try:
+        cur.execute(f'SELECT MAX("{col}") AS m FROM "{table}"')
+        r = cur.fetchone()
+        if not r or r["m"] is None:
+            return 0
+        return int(r["m"])
+    except Exception:
+        return 0
+
+
+def _clone_combo_rows_for_car(
+    cursors_sources: List[sqlite3.Cursor],
+    cur_t: sqlite3.Cursor,
+    table: str,
+    pk_col: str,
+    car_scope_col: str,
+    source_car_id: int,
+    new_car_id: int,
+    extra_rewrites: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Clone per-car rows from a Combo_* table, allocating new unique PK values."""
+    if not _table_exists(cur_t, table):
+        return 0
+
+    cols_t = _cols(_table_info(cur_t, table))
+    if pk_col not in cols_t or car_scope_col not in cols_t:
+        return 0
+
+    # fetch donor rows from first source that has them
+    donor_rows: List[sqlite3.Row] = []
+    src_cols: List[str] = []
+    for cur_s in cursors_sources:
+        try:
+            if not _table_exists(cur_s, table):
+                continue
+            cols_s = _cols(_table_info(cur_s, table))
+            if car_scope_col not in cols_s:
+                continue
+            cur_s.execute(f'SELECT * FROM "{table}" WHERE "{car_scope_col}"=?', (source_car_id,))
+            donor_rows = cur_s.fetchall()
+            if donor_rows:
+                src_cols = cols_s
+                break
+        except Exception:
+            continue
+
+    if not donor_rows:
+        return 0
+
+    # remove existing rows for new car to avoid duplicates
+    cur_t.execute(f'DELETE FROM "{table}" WHERE "{car_scope_col}"=?', (new_car_id,))
+
+    next_pk = _max_int(cur_t, table, pk_col) + 1
+    n = 0
+    for r in donor_rows:
+        ins_cols, ins_vals = _row_to_target_shape(r, src_cols, cols_t)
+
+        # rewrite scope
+        if car_scope_col in ins_cols:
+            ins_vals[ins_cols.index(car_scope_col)] = new_car_id
+        else:
+            ins_cols.append(car_scope_col)
+            ins_vals.append(new_car_id)
+
+        # allocate new PK
+        if pk_col in ins_cols:
+            ins_vals[ins_cols.index(pk_col)] = next_pk
+        else:
+            ins_cols.append(pk_col)
+            ins_vals.append(next_pk)
+
+        # any extra rewrites (EngineID etc.)
+        if extra_rewrites:
+            for k, v in extra_rewrites.items():
+                if k in cols_t:
+                    if k in ins_cols:
+                        ins_vals[ins_cols.index(k)] = v
+                    else:
+                        ins_cols.append(k)
+                        ins_vals.append(v)
+
+        _insert_row(cur_t, table, ins_cols, ins_vals, auto_drop_id=False)
+        next_pk += 1
+        n += 1
+
+    return n
+
+
+def _find_carbody_id(cur: sqlite3.Cursor, car_id: int) -> Optional[int]:
+    if not _table_exists(cur, "Data_CarBody"):
+        return None
+    cols = _cols(_table_info(cur, "Data_CarBody"))
+    if "Id" not in cols:
+        return None
+    base = car_id * 1000
+    cur.execute('SELECT "Id" AS i FROM "Data_CarBody" WHERE "Id">=? AND "Id"<? ORDER BY "Id" LIMIT 1', (base, base + 1000))
+    r = cur.fetchone()
+    return int(r["i"]) if r and r["i"] is not None else None
+
+def _clone_rows(
     cursors_s: List[sqlite3.Cursor],
     cur_t: sqlite3.Cursor,
     table: str,
@@ -834,45 +407,705 @@ def _clone_rows_preserve_id(
     rewrites: Dict[str, Any],
     old_base: int,
     new_base: int,
-    rewrite_base_ids: bool,
+    extra_where: str = "",
+    delete_existing_for_target: Optional[Tuple[str, int]] = None,
 ) -> int:
-    target_tables = set(_list_tables(cur_t))
-    if table not in target_tables:
+    """
+    Clone rows for table where where_col==where_val from the first source cursor that has them,
+    insert into target while applying rewrites and shifting base-block IDs.
+    """
+    if not _table_exists(cur_t, table):
         return 0
 
-    info_t = _table_info(cur_t, table)
-    cols_t = _cols(info_t)
+    tgt_cols = _cols(_table_info(cur_t, table))
 
-    inserted = 0
-    seen: set[Tuple[str, Tuple[Any, ...]]] = set()
+    # delete target rows first to avoid doubled upgrades etc.
+    if delete_existing_for_target:
+        col, v = delete_existing_for_target
+        if col in tgt_cols:
+            cur_t.execute(f'DELETE FROM "{table}" WHERE "{col}"=?', (v,))
+
+    rows: List[sqlite3.Row] = []
+    src_cols: List[str] = []
 
     for cur_s in cursors_s:
-        if table not in set(_list_tables(cur_s)):
+        if not _table_exists(cur_s, table):
             continue
         info_s = _table_info(cur_s, table)
-        cols_s = _cols(info_s)
-        if where_col not in cols_s:
+        src_cols = _cols(info_s)
+        if where_col not in src_cols:
             continue
 
-        cur_s.execute(f'SELECT * FROM "{table}" WHERE "{where_col}"=?', (where_val,))
+        cur_s.execute(
+            f'SELECT * FROM "{table}" WHERE "{where_col}"=?{extra_where}',
+            (where_val,),
+        )
         rows = cur_s.fetchall()
+        if rows:
+            break
 
-        for r in rows:
-            insert_cols, insert_vals = _row_to_target_shape(
-                cols_s, r, cols_t, rewrites, old_base, new_base, rewrite_base_ids
+    if not rows:
+        return 0
+
+    n = 0
+    for r in rows:
+        ic, iv = _row_to_target_shape(r, src_cols, tgt_cols)
+
+        # apply explicit rewrites (Ordinal/CarID/etc.)
+        for k, v in rewrites.items():
+            if k in ic:
+                iv[ic.index(k)] = v
+            else:
+                ic.append(k)
+                iv.append(v)
+
+        # shift base-block IDs (oldCar*1000 -> newCar*1000)
+        _rewrite_base_ids_in_place(ic, iv, old_base, new_base)
+
+        _insert_row(cur_t, table, ic, iv, auto_drop_id=True)
+        n += 1
+
+    return n
+
+
+def clone_car_between(
+    source_db: Path,
+    target_db: Path,
+    source_car_id: int,
+    new_car_id: int,
+    year_marker: int = 6969,
+    extra_source_db: Optional[Path] = None,              # compat
+    all_source_paths: Optional[List[Path]] = None,        # compat
+) -> CloneReport:
+    """
+    FM4-safe car clone into MAIN (target_db).
+
+    Key goals:
+    - Always write to MAIN only.
+    - Clone car-scoped upgrade data (List_Upgrade*), plus Combo_Colors / Combo_Engines.
+    - Clone the donor Data_CarBody *from whichever SLT actually contains it* (MAIN or DLC).
+      This is critical: DLC cars often have their CarBody rows in MAIN, not in the DLC SLT.
+    - Special fix: List_UpgradeCarBody -> copy ONLY stock row (IsStock=1 & Level=0) to avoid cockpit/camera issues.
+    - Adds ContentOffersMapping row if present (ID/ContentID/OfferID), as requested.
+
+    If the donor Data_CarBody block cannot be found in any source, the clone is aborted to avoid creating
+    blank / crashing cars in-game.
+    """
+    source_db = Path(source_db)
+    target_db = Path(target_db)
+    extra_source_db = Path(extra_source_db) if extra_source_db else None
+
+    con_s = _connect(source_db, readonly=True)
+    cur_s = con_s.cursor()
+    con_t = _connect(target_db, readonly=False)
+    cur_t = con_t.cursor()
+
+    # Build a "search set" of read-only source cursors:
+    # - donor SLT
+    # - optional extra_source_db (usually MAIN when cloning DLC)
+    # - optional all_source_paths (all discovered SLTs)
+    cursors_sources: List[sqlite3.Cursor] = [cur_s]
+    extra_cons: List[sqlite3.Connection] = []
+
+    con_x: Optional[sqlite3.Connection] = None
+    if extra_source_db and extra_source_db.resolve() != source_db.resolve():
+        con_x = _connect(extra_source_db, readonly=True)
+        cursors_sources.append(con_x.cursor())
+
+    if all_source_paths:
+        for p in all_source_paths:
+            try:
+                pp = Path(p)
+                if pp.resolve() in {source_db.resolve(), target_db.resolve()}:
+                    continue
+                if extra_source_db and pp.resolve() == extra_source_db.resolve():
+                    continue
+                con_a = _connect(pp, readonly=True)
+                cursors_sources.append(con_a.cursor())
+                extra_cons.append(con_a)
+            except Exception:
+                continue
+
+    if not _table_exists(cur_t, "Data_Car"):
+        raise ValueError("MAIN has no Data_Car table.")
+    if not _table_exists(cur_s, "Data_Car"):
+        raise ValueError(f"{source_db.name} has no Data_Car table.")
+
+    # Ensure new id is free
+    cur_t.execute('SELECT 1 FROM "Data_Car" WHERE "Id"=? LIMIT 1', (new_car_id,))
+    if cur_t.fetchone():
+        raise ValueError(f"MAIN already contains CarID {new_car_id}.")
+
+    # --- clone Data_Car row
+    cur_s.execute('SELECT * FROM "Data_Car" WHERE "Id"=?', (source_car_id,))
+    donor = cur_s.fetchone()
+    if not donor:
+        raise ValueError(f"Source CarID {source_car_id} not found in {source_db.name}.")
+
+    cols_s_car = _cols(_table_info(cur_s, "Data_Car"))
+    cols_t_car = _cols(_table_info(cur_t, "Data_Car"))
+    ic, iv = _row_to_target_shape(donor, cols_s_car, cols_t_car)
+
+    if "Id" in ic:
+        iv[ic.index("Id")] = new_car_id
+    else:
+        ic.append("Id"); iv.append(new_car_id)
+
+    # Year marker: FM4 has both patterns across builds (ModelYear vs Year)
+    if "ModelYear" in cols_t_car:
+        if "ModelYear" in ic:
+            iv[ic.index("ModelYear")] = year_marker
+        else:
+            ic.append("ModelYear"); iv.append(year_marker)
+    elif "Year" in cols_t_car:
+        if "Year" in ic:
+            iv[ic.index("Year")] = year_marker
+        else:
+            ic.append("Year"); iv.append(year_marker)
+
+    _insert_row(cur_t, "Data_Car", ic, iv, auto_drop_id=False)
+
+    old_base = source_car_id * 1000
+    new_base = new_car_id * 1000
+
+    tables_touched: Dict[str, int] = {"Data_Car": 1}
+
+    # --- clone Data_CarBody base-block (from ANY source that contains it)
+    if _table_exists(cur_t, "Data_CarBody"):
+        tgt_cols_body = _cols(_table_info(cur_t, "Data_CarBody"))
+        if "Id" in tgt_cols_body:
+            # clear any pre-existing block
+            cur_t.execute('DELETE FROM "Data_CarBody" WHERE "Id">=? AND "Id"<?', (new_base, new_base + 1000))
+
+            body_rows: List[sqlite3.Row] = []
+            src_cols_body: List[str] = []
+            for cs in cursors_sources:
+                if not _table_exists(cs, "Data_CarBody"):
+                    continue
+                src_cols_body = _cols(_table_info(cs, "Data_CarBody"))
+                if "Id" not in src_cols_body:
+                    continue
+                cs.execute('SELECT * FROM "Data_CarBody" WHERE "Id">=? AND "Id"<? ORDER BY "Id"', (old_base, old_base + 1000))
+                body_rows = cs.fetchall()
+                if body_rows:
+                    break
+
+            if not body_rows:
+                # Abort instead of creating a blank car.
+                raise ValueError(
+                    "Could not find donor Data_CarBody rows in any loaded SLT. "
+                    "This will create a blank/crashing car in-game. "
+                    "Make sure you selected the correct MAIN + DLC folder and try again."
+                )
+
+            for r in body_rows:
+                ic2, iv2 = _row_to_target_shape(r, src_cols_body, tgt_cols_body)
+                if "Id" in ic2:
+                    iv2[ic2.index("Id")] = new_base + (int(r["Id"]) - old_base)
+                _rewrite_base_ids_in_place(ic2, iv2, old_base, new_base)
+                _insert_row(cur_t, "Data_CarBody", ic2, iv2, auto_drop_id=False)
+
+            tables_touched["Data_CarBody"] = len(body_rows)
+    # --- clone List_Upgrade* tables (car- and body-scoped, merged across MAIN+DLC)
+    body_cols = ["CarBodyID", "CarBodyId", "CarbodyId"]
+
+    # Discover donor CarBodyID from the stock row in List_UpgradeCarBody when possible
+    source_body_id = old_base
+    for cs in cursors_sources:
+        if not _table_exists(cs, "List_UpgradeCarBody"):
+            continue
+        cols_ucb = _cols(_table_info(cs, "List_UpgradeCarBody"))
+        bc = next((c for c in body_cols if c in cols_ucb), None)
+        if not bc:
+            continue
+        if "Ordinal" in cols_ucb and "Level" in cols_ucb:
+            cs.execute(f'SELECT "{bc}" AS b FROM "List_UpgradeCarBody" WHERE "Ordinal"=? AND "Level"=0 LIMIT 1', (source_car_id,))
+            rr = cs.fetchone()
+            if rr and rr["b"] is not None:
+                source_body_id = int(rr["b"])
+                break
+    new_body_id = new_base
+
+    for table in _list_tables(cur_t):
+        tl = table.lower()
+        if not tl.startswith("list_upgrade"):
+            continue
+
+        cols_tt = _cols(_table_info(cur_t, table))
+
+        # Special-case: List_UpgradeCarBody => ONLY stock row (cockpit/camera stability)
+        extra_where = ""
+        if tl == "list_upgradecarbody":
+            if "IsStock" in cols_tt and "Level" in cols_tt:
+                extra_where = ' AND ("IsStock"=1 AND "Level"=0)'
+            elif "Level" in cols_tt:
+                extra_where = ' AND ("Level"=0)'
+
+        # Prefer cloning by car scope when possible
+        scope_col = None
+        if "Ordinal" in cols_tt:
+            scope_col = "Ordinal"
+        elif "CarID" in cols_tt:
+            scope_col = "CarID"
+        elif "CarId" in cols_tt:
+            scope_col = "CarId"
+
+        if scope_col:
+            # Rewrite car scope + any CarBodyID columns if present
+            rew = {scope_col: new_car_id}
+            for bc in body_cols:
+                if bc in cols_tt:
+                    rew[bc] = new_body_id
+
+            n = _clone_rows_from_multiple_sources(
+                cursors_s=cursors_sources,
+                cur_t=cur_t,
+                table=table,
+                where_col=scope_col,
+                where_val=source_car_id,
+                rewrites=rew,
+                old_base=old_base,
+                new_base=new_base,
+                rewrite_base_ids=True,
+                delete_existing_for_target=(scope_col, new_car_id),
+                extra_where_sql=extra_where,
             )
-            if not insert_cols:
+            if n:
+                tables_touched[table] = tables_touched.get(table, 0) + n
+            continue
+
+        # Otherwise clone by CarBodyID when a body scope exists
+        bc = next((c for c in body_cols if c in cols_tt), None)
+        if bc:
+            n = _clone_rows_from_multiple_sources(
+                cursors_s=cursors_sources,
+                cur_t=cur_t,
+                table=table,
+                where_col=bc,
+                where_val=source_body_id,
+                rewrites={bc: new_body_id},
+                old_base=old_base,
+                new_base=new_base,
+                rewrite_base_ids=True,
+                delete_existing_for_target=(bc, new_body_id),
+                extra_where_sql="",
+            )
+            if n:
+                tables_touched[table] = tables_touched.get(table, 0) + n
+
+    # --- clone other car-scoped Ordinal/CarID tables (non-upgrade dependencies)
+    # These are critical for things like AntiSwayPhysics, SpringDamperPhysics, camera/physics blocks, etc.
+    # We intentionally skip risky/global tables.
+    skip_prefixes = ("event", "combo_")
+    skip_exact = {"EventParticipants"}
+
+    for table in _list_tables(cur_t):
+        tl = table.lower()
+        if tl.startswith(skip_prefixes) or table in skip_exact:
+            continue
+        if tl.startswith("list_upgrade"):
+            continue
+        if table in ("Data_Car", "Data_CarBody", "Data_Engine", "ContentOffersMapping"):
+            continue
+
+        cols_tt = _cols(_table_info(cur_t, table))
+
+        scope_col = None
+        if "Ordinal" in cols_tt:
+            scope_col = "Ordinal"
+        elif "CarID" in cols_tt:
+            scope_col = "CarID"
+        elif "CarId" in cols_tt:
+            scope_col = "CarId"
+
+        if not scope_col:
+            continue
+
+        # Only consider List_* and Data_* tables to reduce risk of cloning global gameplay tables
+        if not (tl.startswith("list_") or tl.startswith("data_")):
+            continue
+
+        n = _clone_rows_from_multiple_sources(
+            cursors_s=cursors_sources,
+            cur_t=cur_t,
+            table=table,
+            where_col=scope_col,
+            where_val=source_car_id,
+            rewrites={scope_col: new_car_id},
+            old_base=old_base,
+            new_base=new_base,
+            rewrite_base_ids=True,
+            delete_existing_for_target=(scope_col, new_car_id),
+        )
+        if n:
+            tables_touched[table] = tables_touched.get(table, 0) + n
+    
+    # --- explicit per-car dependency tables that do NOT start with List_/Data_
+    # These have been observed to be required for the car to be selectable / not blank in-game.
+    extra_dep_tables = ["CameraOverrides", "CarExceptions", "CarPartPositions"]
+    for tname in extra_dep_tables:
+        if not _table_exists(cur_t, tname):
+            continue
+        cols_tt = _cols(_table_info(cur_t, tname))
+        scope_col = None
+        if "CarID" in cols_tt:
+            scope_col = "CarID"
+        elif "CarId" in cols_tt:
+            scope_col = "CarId"
+        elif "Ordinal" in cols_tt:
+            scope_col = "Ordinal"
+        if not scope_col:
+            continue
+
+        n = _clone_rows_from_multiple_sources(
+            cursors_s=cursors_sources,
+            cur_t=cur_t,
+            table=tname,
+            where_col=scope_col,
+            where_val=source_car_id,
+            rewrites={scope_col: new_car_id},
+            old_base=old_base,
+            new_base=new_base,
+            rewrite_base_ids=True,
+            delete_existing_for_target=(scope_col, new_car_id),
+            extra_where_sql="",
+        )
+        if n:
+            tables_touched[tname] = tables_touched.get(tname, 0) + n
+
+# --- Combo_Colors (per-car)
+    # FM4 pattern: IDs live in the car base-block (CarID*1000 + offset), e.g. 2000001,2000002,...
+    if _table_exists(cur_t, "Combo_Colors"):
+        cols_tc = _cols(_table_info(cur_t, "Combo_Colors"))
+        pkc = "Id" if "Id" in cols_tc else ("ID" if "ID" in cols_tc else None)
+        if pkc and "Ordinal" in cols_tc:
+            donor_rows: List[sqlite3.Row] = []
+            cols_sc: List[str] = []
+            for cs in cursors_sources:
+                if not _table_exists(cs, "Combo_Colors"):
+                    continue
+                cols_sc = _cols(_table_info(cs, "Combo_Colors"))
+                if "Ordinal" not in cols_sc:
+                    continue
+                cs.execute('SELECT * FROM "Combo_Colors" WHERE "Ordinal"=? ORDER BY "{}"'.format(pkc), (source_car_id,))
+                donor_rows = cs.fetchall()
+                if donor_rows:
+                    break
+
+            # clear any existing block for this car
+            cur_t.execute(f'DELETE FROM "Combo_Colors" WHERE "{pkc}">=? AND "{pkc}"<?', (new_car_id*1000, new_car_id*1000 + 1000))
+            cur_t.execute('DELETE FROM "Combo_Colors" WHERE "Ordinal"=?', (new_car_id,))
+
+            for r in donor_rows:
+                ic3, iv3 = _row_to_target_shape(r, cols_sc, cols_tc)
+
+                # scope
+                if "Ordinal" in ic3:
+                    iv3[ic3.index("Ordinal")] = new_car_id
+                else:
+                    ic3.append("Ordinal"); iv3.append(new_car_id)
+
+                # FM4 base-block PK allocation
+                donor_pk = int(r[pkc]) if pkc in r.keys() and r[pkc] is not None else None
+                if donor_pk is not None:
+                    off = donor_pk - (source_car_id * 1000)
+                    if 0 <= off < 1000:
+                        newpk = (new_car_id * 1000) + off
+                    else:
+                        newpk = (new_car_id * 1000) + 1
+                else:
+                    newpk = (new_car_id * 1000) + 1
+
+                if pkc in ic3:
+                    iv3[ic3.index(pkc)] = newpk
+                else:
+                    ic3.append(pkc); iv3.append(newpk)
+
+                _insert_row(cur_t, "Combo_Colors", ic3, iv3, auto_drop_id=False)
+
+            if donor_rows:
+                tables_touched["Combo_Colors"] = len(donor_rows)
+
+    # --- Combo_Engines (per-car) - allocate new PKs (conservative)
+    if _table_exists(cur_t, "Combo_Engines"):
+        cols_te = _cols(_table_info(cur_t, "Combo_Engines"))
+        pke = "EngineComboID" if "EngineComboID" in cols_te else ("Id" if "Id" in cols_te else ("ID" if "ID" in cols_te else None))
+        if pke and "Ordinal" in cols_te:
+            donor_rows: List[sqlite3.Row] = []
+            cols_se: List[str] = []
+            for cs in cursors_sources:
+                if not _table_exists(cs, "Combo_Engines"):
+                    continue
+                cols_se = _cols(_table_info(cs, "Combo_Engines"))
+                if "Ordinal" not in cols_se:
+                    continue
+                cs.execute('SELECT * FROM "Combo_Engines" WHERE "Ordinal"=?', (source_car_id,))
+                donor_rows = cs.fetchall()
+                if donor_rows:
+                    break
+
+            for r in donor_rows:
+                ic4, iv4 = _row_to_target_shape(r, cols_se, cols_te)
+                if "Ordinal" in ic4:
+                    iv4[ic4.index("Ordinal")] = new_car_id
+                else:
+                    ic4.append("Ordinal"); iv4.append(new_car_id)
+                cur_t.execute(f'SELECT MAX("{pke}") AS m FROM "Combo_Engines"')
+                newpk = int(cur_t.fetchone()["m"] or 0) + 1
+                if pke in ic4:
+                    iv4[ic4.index(pke)] = newpk
+                else:
+                    ic4.append(pke); iv4.append(newpk)
+                _insert_row(cur_t, "Combo_Engines", ic4, iv4, auto_drop_id=False)
+
+            if donor_rows:
+                tables_touched["Combo_Engines"] = len(donor_rows)
+
+    # --- ContentOffersMapping insert
+    if _table_exists(cur_t, "ContentOffersMapping"):
+        cols_cm = _cols(_table_info(cur_t, "ContentOffersMapping"))
+        if {"ID", "ContentID", "OfferID"}.issubset(cols_cm):
+            cur_t.execute('DELETE FROM "ContentOffersMapping" WHERE "ID"=?', (new_car_id,))
+            _insert_row(
+                cur_t,
+                "ContentOffersMapping",
+                ["ID", "ContentID", "OfferID"],
+                [new_car_id, new_car_id, 5571807128695127040],
+                auto_drop_id=False,
+            )
+            tables_touched["ContentOffersMapping"] = 1
+        elif {"Id", "ContentId", "OfferId"}.issubset(cols_cm):
+            cur_t.execute('DELETE FROM "ContentOffersMapping" WHERE "ContentId"=?', (new_car_id,))
+            cols_ins = ["Id", "ContentId", "OfferId"]
+            vals_ins = [new_car_id, new_car_id, 5571807128695127040]
+            if "ContentType" in cols_cm:
+                cols_ins.append("ContentType")
+                vals_ins.append(1)
+            _insert_row(cur_t, "ContentOffersMapping", cols_ins, vals_ins, auto_drop_id=False)
+            tables_touched["ContentOffersMapping"] = 1
+
+    con_t.commit()
+
+    con_s.close()
+    if con_x:
+        con_x.close()
+    for c in extra_cons:
+        c.close()
+    con_t.close()
+
+    return CloneReport(
+        source_db=source_db,
+        target_db=target_db,
+        extra_source_db=extra_source_db,
+        source_car_id=source_car_id,
+        new_car_id=new_car_id,
+        year_marker=year_marker,
+        source_body_id=old_base,
+        new_body_id=new_base,
+        old_base=old_base,
+        new_base=new_base,
+        tables_touched=dict(sorted(tables_touched.items(), key=lambda kv: (-kv[1], kv[0]))),
+    )
+
+
+
+def _clone_torque_curves_for_engine(
+    cursors_sources: List[sqlite3.Cursor],
+    cur_t: sqlite3.Cursor,
+    source_engine_id: int,
+    new_engine_id: int,
+) -> int:
+    """
+    Clone torque curves referenced by the donor engine's upgrade rows.
+
+    IMPORTANT:
+    We do NOT assume TorqueCurveID = EngineID*100 or *1000.
+    Instead:
+      1) Scan all List_Upgrade* rows for source_engine_id and collect any TorqueCurve*ID values.
+      2) For each referenced curve ID, if it looks like it's in the donor engine block (either *1000 or *100),
+         remap it to the new engine's block using the same offset.
+      3) Copy the List_TorqueCurve rows for those IDs into MAIN using the remapped ID.
+      4) Rewrite torque curve references in the newly-cloned upgrade rows (EngineID = new_engine_id).
+
+    This matches the behavior you manually validated (adding 2000000,2000002,... makes cars work).
+    """
+    if not _table_exists(cur_t, "List_TorqueCurve"):
+        return 0
+
+    # Detect torque curve ID column name in MAIN
+    cols_tc_main = _cols(_table_info(cur_t, "List_TorqueCurve"))
+    tc_id_col = None
+    for cand in ("TorqueCurveID", "TorqueCurveId", "Id", "ID"):
+        if cand in cols_tc_main:
+            tc_id_col = cand
+            break
+    if not tc_id_col:
+        return 0
+
+    # 1) Collect referenced torque curve IDs from donor engine upgrade rows (across all sources)
+    referenced: set[int] = set()
+
+    # We scan ANY List_Upgrade* table that has an engine ref column AND any TorqueCurve*ID column(s)
+    engine_ref_cols = ["EngineID", "EngineId", "Engine", "EngineDataID", "Data_EngineID", "Data_EngineId"]
+
+    # Use target table list as a "schema anchor"
+    for table in _list_tables(cur_t):
+        if not table.lower().startswith("list_upgrade"):
+            continue
+
+        # find a source that has this table & columns
+        src_cols = None
+        eng_col = None
+        tc_cols = None
+
+        for cs in cursors_sources:
+            if not _table_exists(cs, table):
+                continue
+            cols_s = _cols(_table_info(cs, table))
+            ec = next((c for c in engine_ref_cols if c in cols_s), None)
+            if not ec:
+                continue
+            tcc = [c for c in cols_s if ("torquecurve" in c.lower() and c.lower().endswith("id"))]
+            if not tcc:
+                continue
+            src_cols = cols_s
+            eng_col = ec
+            tc_cols = tcc
+            break
+
+        if not src_cols or not eng_col or not tc_cols:
+            continue
+
+        for cs in cursors_sources:
+            if not _table_exists(cs, table):
+                continue
+            cols_s = _cols(_table_info(cs, table))
+            if eng_col not in cols_s:
+                continue
+            # only pick torque curve columns that exist in this cursor's table
+            tcc = [c for c in tc_cols if c in cols_s]
+            if not tcc:
                 continue
 
-            sig = (",".join(insert_cols), tuple(insert_vals))
-            if sig in seen:
+            try:
+                sel = ",".join([f'"{c}"' for c in tcc])
+                cs.execute(
+                    f'SELECT {sel} FROM "{table}" WHERE "{eng_col}"=?',
+                    (source_engine_id,),
+                )
+                for r in cs.fetchall():
+                    for c in tcc:
+                        v = _safe_int(r[c])
+                        if v is not None and v > 0:
+                            referenced.add(v)
+            except Exception:
                 continue
-            seen.add(sig)
 
-            _insert_row_preserve_id(cur_t, table, insert_cols, insert_vals)
-            inserted += 1
+    if not referenced:
+        return 0
+
+    # 2) Build mapping old_curve_id -> new_curve_id
+    # Support both block styles:
+    #  - EngineID*1000 + offset (0..999)
+    #  - EngineID*100  + offset (0..99)
+    map_old_to_new: Dict[int, int] = {}
+    for old_id in sorted(referenced):
+        off1000 = old_id - (source_engine_id * 1000)
+        if 0 <= off1000 < 1000:
+            map_old_to_new[old_id] = (new_engine_id * 1000) + off1000
+            continue
+
+        off100 = old_id - (source_engine_id * 100)
+        if 0 <= off100 < 100:
+            map_old_to_new[old_id] = (new_engine_id * 100) + off100
+            continue
+
+        # Not in a recognizable donor block; keep as-is (some curves are global/shared)
+        map_old_to_new[old_id] = old_id
+
+    # 3) Copy List_TorqueCurve rows for these IDs into MAIN (with remapped IDs)
+    # Delete any destination IDs first to avoid UNIQUE constraint issues
+    dest_ids = sorted(set(map_old_to_new.values()))
+    # Only delete IDs that are within the new engine blocks (avoid deleting global curves)
+    delete_ids = [nid for oid, nid in map_old_to_new.items() if nid != oid and (nid // 100 == new_engine_id or nid // 1000 == new_engine_id)]
+    if delete_ids:
+        # chunked deletes to avoid SQLite parameter limits
+        for i in range(0, len(delete_ids), 400):
+            chunk = delete_ids[i:i+400]
+            ph = ",".join(["?"] * len(chunk))
+            cur_t.execute(f'DELETE FROM "List_TorqueCurve" WHERE "{tc_id_col}" IN ({ph})', chunk)
+
+    inserted = 0
+    seen_insert: set[int] = set()
+
+    for old_id in sorted(map_old_to_new.keys()):
+        new_id = map_old_to_new[old_id]
+        if new_id in seen_insert:
+            continue
+
+        # find the donor row across sources
+        donor_row = None
+        donor_cols = None
+        for cs in cursors_sources:
+            if not _table_exists(cs, "List_TorqueCurve"):
+                continue
+            cols_s = _cols(_table_info(cs, "List_TorqueCurve"))
+            if tc_id_col not in cols_s:
+                continue
+            try:
+                cs.execute(f'SELECT * FROM "List_TorqueCurve" WHERE "{tc_id_col}"=? LIMIT 1', (old_id,))
+                rr = cs.fetchone()
+                if rr:
+                    donor_row = rr
+                    donor_cols = cols_s
+                    break
+            except Exception:
+                continue
+
+        if not donor_row or not donor_cols:
+            # Missing curve row � this is exactly what crashes the game.
+            # We keep going so we can clone what we can, but caller should treat this as critical.
+            continue
+
+        ic, iv = _row_to_target_shape(donor_row, donor_cols, cols_tc_main)
+
+        if tc_id_col in ic:
+            iv[ic.index(tc_id_col)] = new_id
+        else:
+            ic.append(tc_id_col)
+            iv.append(new_id)
+
+        _insert_row(cur_t, "List_TorqueCurve", ic, iv, auto_drop_id=False)
+        seen_insert.add(new_id)
+        inserted += 1
+
+    # 4) Rewrite torque curve references in MAIN upgrade rows for the NEW engine only
+    # This ensures we don't touch other engines/cars.
+    for table in _list_tables(cur_t):
+        if not table.lower().startswith("list_upgrade"):
+            continue
+        cols = _cols(_table_info(cur_t, table))
+
+        eng_col = next((c for c in engine_ref_cols if c in cols), None)
+        if not eng_col:
+            continue
+
+        tc_cols = [c for c in cols if ("torquecurve" in c.lower() and c.lower().endswith("id"))]
+        if not tc_cols:
+            continue
+
+        for c in tc_cols:
+            # For each mapping pair, update only rows of the newly cloned engine
+            for old_id, new_id in map_old_to_new.items():
+                if old_id == new_id:
+                    continue
+                cur_t.execute(
+                    f'UPDATE "{table}" SET "{c}"=? WHERE "{eng_col}"=? AND "{c}"=?',
+                    (new_id, new_engine_id, old_id),
+                )
 
     return inserted
+
 
 
 def clone_engine_to_main(
@@ -883,18 +1116,17 @@ def clone_engine_to_main(
     all_source_paths: Optional[List[Path]] = None,
 ) -> int:
     """
-    Conservative engine clone (safe scope, FM4-friendly):
-
-    - Clone ONLY Data_Engine row (source_engine_id -> new_engine_id)
-    - Clone ONLY List_UpgradeEngine* tables (engine-specific upgrade tables)
-      EXCEPT List_UpgradeEngine (car<->engine mapping; do NOT clone globally)
-    - Clone referenced torque curves (List_TorqueCurve) so 2000xxx curve IDs exist.
+    Conservative engine clone (reduced scope):
+    - clones ONLY the Data_Engine row
+    - clones ONLY List_Upgrade* rows that reference the donor EngineID
+    - rewrites base-block IDs inside those cloned rows (old_base..old_base+999 -> new_base..)
+    This avoids global tables like Combo_* that cause UNIQUE constraint failures.
     """
     old_base = source_engine_id * 1000
     new_base = new_engine_id * 1000
 
-    con_s = _connect(source_db)
-    con_t = _connect(main_db)
+    con_s = _connect(Path(source_db), readonly=True)
+    con_t = _connect(Path(main_db), readonly=False)
     cur_s = con_s.cursor()
     cur_t = con_t.cursor()
 
@@ -903,7 +1135,7 @@ def clone_engine_to_main(
 
     if "Data_Engine" not in tables_s:
         con_s.close(); con_t.close()
-        raise ValueError(f"{source_db.name} has no Data_Engine table.")
+        raise ValueError(f"{Path(source_db).name} has no Data_Engine table.")
     if "Data_Engine" not in tables_t:
         con_s.close(); con_t.close()
         raise ValueError("MAIN has no Data_Engine table.")
@@ -911,104 +1143,68 @@ def clone_engine_to_main(
     cols_s = _cols(_table_info(cur_s, "Data_Engine"))
     cols_t = _cols(_table_info(cur_t, "Data_Engine"))
 
-    id_col_s = (
-        "Id" if "Id" in cols_s else
-        "EngineID" if "EngineID" in cols_s else
-        "EngineId" if "EngineId" in cols_s else
-        None
-    )
-    id_col_t = (
-        "Id" if "Id" in cols_t else
-        "EngineID" if "EngineID" in cols_t else
-        "EngineId" if "EngineId" in cols_t else
-        None
-    )
+    id_col_s = "Id" if "Id" in cols_s else ("EngineID" if "EngineID" in cols_s else ("EngineId" if "EngineId" in cols_s else None))
+    id_col_t = "Id" if "Id" in cols_t else ("EngineID" if "EngineID" in cols_t else ("EngineId" if "EngineId" in cols_t else None))
     if not id_col_s or not id_col_t:
         con_s.close(); con_t.close()
         raise ValueError("Could not find Id/EngineID column in Data_Engine (source or MAIN).")
 
-    # Read donor engine row
     cur_s.execute(f'SELECT * FROM "Data_Engine" WHERE "{id_col_s}"=?', (source_engine_id,))
     row = cur_s.fetchone()
     if not row:
         con_s.close(); con_t.close()
-        raise ValueError(f"Source engine {source_engine_id} not found in {source_db.name}.")
+        raise ValueError(f"Source engine {source_engine_id} not found in {Path(source_db).name}.")
 
-    # Ensure new id is free in MAIN
     cur_t.execute(f'SELECT COUNT(*) AS c FROM "Data_Engine" WHERE "{id_col_t}"=?', (new_engine_id,))
     if int(cur_t.fetchone()["c"] or 0) != 0:
         con_s.close(); con_t.close()
         raise ValueError(f"MAIN already contains EngineID {new_engine_id}.")
 
-    # Insert Data_Engine row (intersection of columns)
+    # insert Data_Engine
     src_map = {c: row[c] for c in cols_s if c in row.keys()}
     insert_cols = [c for c in cols_t if c in src_map]
     insert_vals = [src_map[c] for c in insert_cols]
-
     if id_col_t in insert_cols:
         insert_vals[insert_cols.index(id_col_t)] = new_engine_id
     else:
-        insert_cols.append(id_col_t)
-        insert_vals.append(new_engine_id)
+        insert_cols.append(id_col_t); insert_vals.append(new_engine_id)
 
-    placeholders = ",".join(["?"] * len(insert_cols))
-    cols_sql = ",".join([f'"{c}"' for c in insert_cols])
-    cur_t.execute(f'INSERT INTO "Data_Engine" ({cols_sql}) VALUES ({placeholders})', insert_vals)
+    _insert_row(cur_t, "Data_Engine", insert_cols, insert_vals, auto_drop_id=False)
 
-    # We’ll clone from donor source, but also allow MAIN to act as a source if you’ve added rows there before
+    # Clone ONLY List_Upgrade* rows that reference this engine
+    engine_ref_cols = ["EngineID", "EngineId", "Engine", "EngineDataID", "Data_EngineID", "Data_EngineId"]
+    # Sources for these rows:
+    # - donor SLT
+    # - MAIN (some DLC additions live in MAIN already)
+    # - optional other SLTs (if provided)
     aux_sources = [cur_s, cur_t]
-
-    # Clone ONLY engine-specific upgrade tables, not car<->engine mapping table.
-    # List_UpgradeEngine is NOT an engine dependency table.
-    engine_ref_cols = [
-        "EngineID", "EngineId", "Engine",
-        "EngineDataID", "Data_EngineID", "Data_EngineId"
-    ]
-
-    # Collect torque curve IDs used by donor engine upgrade rows (before rewrite)
-    # We then clone those curves into the new_base range.
-    donor_torque_curve_ids: set[int] = set()
-
-    def _collect_torque_curve_ids_from_table(table: str):
-        if table not in tables_s:
-            return
-        cols = _cols(_table_info(cur_s, table))
-        # Look for columns like TorqueCurve...ID
-        tc_cols = [c for c in cols if "torquecurve" in c.lower() and c.lower().endswith("id")]
-        if not tc_cols:
-            return
-
-        # Find engine reference column
-        ref_col = next((c for c in engine_ref_cols if c in cols), None)
-        if not ref_col:
-            return
-
-        tc_cols_sql = ",".join(f'"{c}"' for c in tc_cols)
-        cur_s.execute(
-        f'SELECT {tc_cols_sql} FROM "{table}" WHERE "{ref_col}"=?',
-        (source_engine_id,)
-)
-
-        for rr in cur_s.fetchall():
-            for c in tc_cols:
-                try:
-                    v = int(rr[c])
-                except Exception:
+    extra_cons: List[sqlite3.Connection] = []
+    if all_source_paths:
+        for p in all_source_paths:
+            try:
+                pp = Path(p)
+                if pp.resolve() in {Path(source_db).resolve(), Path(main_db).resolve()}:
                     continue
-                if old_base <= v < old_base + 1000:
-                    donor_torque_curve_ids.add(v)
+                con_a = _connect(pp, readonly=True)
+                aux_sources.append(con_a.cursor())
+                extra_cons.append(con_a)
+            except Exception:
+                continue
 
-    # Clone the engine upgrade tables and gather torque curve ids along the way
+
+
+
     for table in sorted(tables_t):
-        tl = table.lower()
-        if not tl.startswith("list_upgradeengine"):
-            continue
-        if tl == "list_upgradeengine":
-            # EXCLUDE car<->engine mapping table
+
+        # Skip global combo tables (they are shared lookups and often have UNIQUE PKs)
+        if table.lower().startswith("combo_"):
             continue
 
-        # Pull torque curve ids from donor before cloning (safe for any engine upgrade table)
-        _collect_torque_curve_ids_from_table(table)
+        if table.lower() == "list_upgradeengine":
+            continue
+
+        if not table.lower().startswith("list_upgrade"):
+            continue
 
         cols = _cols(_table_info(cur_t, table))
         ref_col = next((c for c in engine_ref_cols if c in cols), None)
@@ -1025,529 +1221,15 @@ def clone_engine_to_main(
             old_base=old_base,
             new_base=new_base,
             rewrite_base_ids=True,
+            delete_existing_for_target=(ref_col, new_engine_id),
         )
 
-    # Now clone required torque curves into MAIN so the rewritten 2000xxx IDs exist.
-    # Table name and ID column may vary slightly; detect common patterns.
-    if "List_TorqueCurve" in tables_t and donor_torque_curve_ids:
-        cols_tc_t = _cols(_table_info(cur_t, "List_TorqueCurve"))
-        cols_tc_s = _cols(_table_info(cur_s, "List_TorqueCurve")) if "List_TorqueCurve" in tables_s else []
-
-        # Identify torque curve ID column in target
-        tc_id_col_t = (
-            "TorqueCurveID" if "TorqueCurveID" in cols_tc_t else
-            "TorqueCurveId" if "TorqueCurveId" in cols_tc_t else
-            "Id" if "Id" in cols_tc_t else
-            "ID" if "ID" in cols_tc_t else
-            None
-        )
-        tc_id_col_s = (
-            "TorqueCurveID" if "TorqueCurveID" in cols_tc_s else
-            "TorqueCurveId" if "TorqueCurveId" in cols_tc_s else
-            "Id" if "Id" in cols_tc_s else
-            "ID" if "ID" in cols_tc_s else
-            None
-        )
-
-        if tc_id_col_t and tc_id_col_s and "List_TorqueCurve" in tables_s:
-            # Determine whether we must preserve the PK on insert
-            info_tc_t = _table_info(cur_t, "List_TorqueCurve")
-            # If it's a single integer PK, _insert_row may drop it unless we tell it not to.
-            # We'll insert manually, preserving the ID.
-            for old_tc_id in sorted(donor_torque_curve_ids):
-                new_tc_id = new_base + (old_tc_id - old_base)
-
-                # Skip if already exists
-                cur_t.execute(f'SELECT 1 FROM "List_TorqueCurve" WHERE "{tc_id_col_t}"=? LIMIT 1', (new_tc_id,))
-                if cur_t.fetchone():
-                    continue
-
-                # Read donor curve row
-                cur_s.execute(f'SELECT * FROM "List_TorqueCurve" WHERE "{tc_id_col_s}"=?', (old_tc_id,))
-                tc_row = cur_s.fetchone()
-                if not tc_row:
-                    # If donor missing curve row, that's a hard problem; better to fail loudly
-                    con_s.close(); con_t.close()
-                    raise ValueError(f"Missing donor torque curve {old_tc_id} in List_TorqueCurve; cannot clone engine safely.")
-
-                src_tc_map = {c: tc_row[c] for c in cols_tc_s if c in tc_row.keys()}
-
-                insert_tc_cols = [c for c in cols_tc_t if c in src_tc_map]
-                insert_tc_vals = [src_tc_map[c] for c in insert_tc_cols]
-
-                # Force new torque curve ID
-                if tc_id_col_t in insert_tc_cols:
-                    insert_tc_vals[insert_tc_cols.index(tc_id_col_t)] = new_tc_id
-                else:
-                    insert_tc_cols.append(tc_id_col_t)
-                    insert_tc_vals.append(new_tc_id)
-
-                placeholders = ",".join(["?"] * len(insert_tc_cols))
-                cols_sql = ",".join([f'"{c}"' for c in insert_tc_cols])
-                cur_t.execute(f'INSERT INTO "List_TorqueCurve" ({cols_sql}) VALUES ({placeholders})', insert_tc_vals)
+    # Clone torque curves referenced by the engine upgrade rows we just cloned
+    _clone_torque_curves_for_engine(aux_sources, cur_t, source_engine_id, new_engine_id)
 
     con_t.commit()
     con_s.close()
+    for c in extra_cons:
+        c.close()
     con_t.close()
     return 1
-
-
-def _lookup_table_best_effort(main_db: Path, table_candidates: List[str], label_candidates: List[str]) -> List[Tuple[int, str]]:
-    con = _connect(main_db)
-    cur = con.cursor()
-    tables = set(_list_tables(cur))
-
-    table = next((t for t in table_candidates if t in tables), None)
-    if not table:
-        con.close()
-        return []
-
-    cols = _cols(_table_info(cur, table))
-    label_col = next((c for c in label_candidates if c in cols), None)
-    if not label_col:
-        con.close()
-        return []
-
-    if "Id" in cols:
-        id_col = "Id"
-    else:
-        id_col = next((c for c in cols if c.lower().endswith("id")), None)
-    if not id_col:
-        con.close()
-        return []
-
-    cur.execute(f'SELECT "{id_col}" AS i, "{label_col}" AS l FROM "{table}" ORDER BY "{id_col}"')
-    out = []
-    for r in cur.fetchall():
-        i = _safe_int(r["i"])
-        if i is None:
-            continue
-        out.append((i, str(r["l"])))
-    con.close()
-    return out
-
-
-def get_engine_editor_options(main_db: Path) -> Dict[str, List[Tuple[int, str]]]:
-    return {
-        "aspiration": _lookup_table_best_effort(main_db, ["List_Aspiration"], ["Aspiration"]),
-        "cylinder": _lookup_table_best_effort(
-            main_db,
-            ["List_Cylinder", "List_cylinder", "List_Cylinders", "List_cylinders"],
-            ["Number"],
-        ),
-        "config": _lookup_table_best_effort(
-            main_db,
-            ["List_EngineConfig", "List_Engineconfig", "List_Engineconfig"],
-            ["EngineConfig"],
-        ),
-        "vtiming": _lookup_table_best_effort(
-            main_db,
-            ["List_Variabletiming", "List_VariableTiming"],
-            ["VariableTimingType"],
-        ),
-    }
-
-
-def get_engine_fields_from_db(db_path: Path, engine_id: int) -> Dict[str, Any]:
-    """
-    Read engine fields from a specific SLT (MAIN or DLC).
-    This is used by the UI so EngineName/MediaName etc load correctly even when the
-    selected engine originates from a DLC SLT.
-    """
-    con = _connect(db_path)
-    cur = con.cursor()
-    if "Data_Engine" not in set(_list_tables(cur)):
-        con.close()
-        raise ValueError(f"{db_path.name} missing Data_Engine.")
-
-    cols = _cols(_table_info(cur, "Data_Engine"))
-    id_col = "Id" if "Id" in cols else ("EngineID" if "EngineID" in cols else ("EngineId" if "EngineId" in cols else None))
-    if not id_col:
-        con.close()
-        raise ValueError(f"No Id/EngineID column in {db_path.name} Data_Engine.")
-
-    cur.execute(f'SELECT * FROM "Data_Engine" WHERE "{id_col}"=?', (engine_id,))
-    r = cur.fetchone()
-    if not r:
-        con.close()
-        raise ValueError(f"Engine {engine_id} not found in {db_path.name}.")
-
-    def pick(*names: str) -> Optional[str]:
-        return next((n for n in names if n in cols), None)
-
-    out: Dict[str, Any] = {"EngineID": engine_id}
-
-    c_asp = pick("AspirationID_Stock", "AspirationIDStock", "AspirationID")
-    c_cyl = pick("CylinderID")
-    c_cfg = pick("ConfigID", "EngineConfigID")
-    c_vt = pick("VariableTimingID", "VariableTimingId", "VariableTiming")
-    c_com = pick("Compression")
-    c_boo = pick("StockBoost-bar", "StockBoost_bar", "StockBoostBar", "StockBoost")
-
-    c_carb = pick("Carbureted", "IsCarbureted")
-    c_diesel = pick("Diesel", "IsDiesel")
-    c_rot = pick("Rotary", "IsRotary")
-
-    # For your case EngineName is the real familiar name, so we prioritize it
-    c_mn = pick("MediaName", "EngineMedia", "Media", "Media_Name")
-    c_en = pick("EngineName", "Name", "Engine_Name", "EngineNameKey", "EngineName_Key")
-
-    for key, col in [
-        ("AspirationID_Stock", c_asp),
-        ("CylinderID", c_cyl),
-        ("ConfigID", c_cfg),
-        ("VariableTimingID", c_vt),
-        ("Compression", c_com),
-        ("StockBoost-bar", c_boo),
-        ("Carbureted", c_carb),
-        ("Diesel", c_diesel),
-        ("Rotary", c_rot),
-        ("MediaName", c_mn),
-        ("EngineName", c_en),
-    ]:
-        if col:
-            out[key] = r[col]
-
-    con.close()
-    return out
-
-
-def get_engine_fields(main_db: Path, engine_id: int) -> Dict[str, Any]:
-    # Backwards-compatible wrapper (MAIN only)
-    return get_engine_fields_from_db(main_db, engine_id)
-
-
-def update_engine_fields(main_db: Path, engine_id: int, changes: Dict[str, Any]) -> int:
-    con = _connect(main_db)
-    cur = con.cursor()
-    if "Data_Engine" not in set(_list_tables(cur)):
-        con.close()
-        raise ValueError("MAIN missing Data_Engine.")
-
-    cols = _cols(_table_info(cur, "Data_Engine"))
-    id_col = "Id" if "Id" in cols else ("EngineID" if "EngineID" in cols else ("EngineId" if "EngineId" in cols else None))
-    if not id_col:
-        con.close()
-        raise ValueError("No Id/EngineID column in MAIN Data_Engine.")
-
-    def pick(*names: str) -> Optional[str]:
-        return next((n for n in names if n in cols), None)
-
-    colmap = {
-        "AspirationID_Stock": pick("AspirationID_Stock", "AspirationIDStock", "AspirationID"),
-        "CylinderID": pick("CylinderID"),
-        "ConfigID": pick("ConfigID", "EngineConfigID"),
-        "VariableTimingID": pick("VariableTimingID", "VariableTimingId", "VariableTiming"),
-        "Compression": pick("Compression"),
-        "StockBoost-bar": pick("StockBoost-bar", "StockBoost_bar", "StockBoostBar", "StockBoost"),
-        "Carbureted": pick("Carbureted", "IsCarbureted"),
-        "Diesel": pick("Diesel", "IsDiesel"),
-        "Rotary": pick("Rotary", "IsRotary"),
-        "MediaName": pick("MediaName", "EngineMedia", "Media", "Media_Name"),
-        "EngineName": pick("EngineName", "Name", "Engine_Name", "EngineNameKey", "EngineName_Key"),
-    }
-
-    sets = []
-    vals = []
-    for k, v in changes.items():
-        col = colmap.get(k)
-        if not col:
-            continue
-        sets.append(f'"{col}"=?')
-        vals.append(v)
-
-    if not sets:
-        con.close()
-        return 0
-
-    vals.append(engine_id)
-    cur.execute(f'UPDATE "Data_Engine" SET {", ".join(sets)} WHERE "{id_col}"=?', vals)
-    n = cur.rowcount
-    con.commit()
-    con.close()
-    return n
-
-
-# -----------------------------
-# Car editor lookup options (for Quick Tweaks dropdowns)
-# -----------------------------
-
-def lookup_options(main_db: Path, table_candidates: List[str], label_candidates: List[str]) -> List[Tuple[int, str]]:
-    con = _connect(main_db)
-    cur = con.cursor()
-
-    chosen_table = next((t for t in table_candidates if _table_exists(cur, t)), None)
-    if not chosen_table:
-        con.close()
-        return []
-
-    cols = _cols(_table_info(cur, chosen_table))
-    label_col = next((c for c in label_candidates if c in cols), None)
-    if not label_col:
-        con.close()
-        return []
-
-    if "Id" in cols:
-        id_col = "Id"
-    else:
-        id_col = next((c for c in cols if c.lower().endswith("id")), None)
-
-    if not id_col:
-        con.close()
-        return []
-
-    cur.execute(f'SELECT "{id_col}" AS i, "{label_col}" AS l FROM "{chosen_table}" ORDER BY "{id_col}"')
-    out: List[Tuple[int, str]] = []
-    for r in cur.fetchall():
-        i = _safe_int(r["i"])
-        if i is None:
-            continue
-        out.append((i, str(r["l"])))
-    con.close()
-    return out
-
-
-def get_car_editor_options(main_db: Path) -> Dict[str, List[Tuple[int, str]]]:
-    return {
-        "EnginePlacementID": lookup_options(main_db, ["List_EnginePlacement"], ["EnginePlacement"]),
-        "MaterialTypeID": lookup_options(main_db, ["List_MaterialType"], ["Material"]),
-        "EngineConfigID": lookup_options(main_db, ["List_EngineConfig", "List_Engineconfig"], ["EngineConfig"]),
-        "DriveTypeID": lookup_options(main_db, ["List_DriveType", "List_Drivetype"], ["DriveType"]),
-    }
-
-
-# -----------------------------
-# Quick Tweaks (car) — FIXED rear/back name variants
-# -----------------------------
-
-_BODY_FIELD_CANDIDATES: Dict[str, List[str]] = {
-    "ModelFrontStockRideHeight": ["ModelFrontStockRideHeight"],
-    "ModelBackStockRideHeight": ["ModelBackStockRideHeight", "ModelRearStockRideHeight"],
-    "ModelFrontTrackOuter": ["ModelFrontTrackOuter"],
-    "ModelBackTrackOuter": ["ModelBackTrackOuter", "ModelRearTrackOuter"],
-}
-
-
-def _pick_existing_col(cols: List[str], candidates: List[str]) -> Optional[str]:
-    for c in candidates:
-        if c in cols:
-            return c
-    return None
-
-
-def get_quick_tweaks(db_path: Path, car_id: int) -> Dict[str, Any]:
-    con = _connect(db_path)
-    cur = con.cursor()
-
-    out: Dict[str, Any] = {}
-
-    cur.execute('SELECT * FROM Data_Car WHERE Id=?', (car_id,))
-    r = cur.fetchone()
-    if r:
-        for k in [
-            "CarTypeID", "ClassID", "EnginePlacementID", "MaterialTypeID",
-            "CurbWeight", "WeightDistribution", "EngineConfigID", "DriveTypeID",
-            "Year"
-        ]:
-            if k in r.keys():
-                out[f"Data_Car.{k}"] = r[k]
-
-    body_id = get_car_body_id(db_path, car_id)
-    if "Data_CarBody" in set(_list_tables(cur)):
-        cur.execute('SELECT * FROM Data_CarBody WHERE Id=?', (body_id,))
-        b = cur.fetchone()
-        if b:
-            cols_b = list(b.keys())
-            for canonical, candidates in _BODY_FIELD_CANDIDATES.items():
-                col = _pick_existing_col(cols_b, candidates)
-                if col:
-                    out[f"Data_CarBody.{canonical}"] = b[col]
-
-    con.close()
-    return out
-
-
-def apply_quick_tweaks(db_path: Path, car_id: int, changes: Dict[str, Any]) -> Dict[str, int]:
-    con = _connect(db_path)
-    cur = con.cursor()
-
-    updated: Dict[str, int] = {"Data_Car": 0, "Data_CarBody": 0}
-
-    car_changes = {k.split(".", 1)[1]: v for k, v in changes.items() if k.startswith("Data_Car.")}
-    body_changes_raw = {k.split(".", 1)[1]: v for k, v in changes.items() if k.startswith("Data_CarBody.")}
-
-    if car_changes:
-        sets = ", ".join([f'"{k}"=?' for k in car_changes.keys()])
-        vals = list(car_changes.values()) + [car_id]
-        cur.execute(f'UPDATE "Data_Car" SET {sets} WHERE "Id"=?', vals)
-        updated["Data_Car"] = cur.rowcount
-
-    if body_changes_raw and "Data_CarBody" in set(_list_tables(cur)):
-        body_id = get_car_body_id(db_path, car_id)
-
-        info = _table_info(cur, "Data_CarBody")
-        cols_body = _cols(info)
-
-        body_changes: Dict[str, Any] = {}
-        for canonical_key, v in body_changes_raw.items():
-            if canonical_key in _BODY_FIELD_CANDIDATES:
-                actual_col = _pick_existing_col(cols_body, _BODY_FIELD_CANDIDATES[canonical_key])
-                if actual_col:
-                    body_changes[actual_col] = v
-            else:
-                if canonical_key in cols_body:
-                    body_changes[canonical_key] = v
-
-        if body_changes:
-            sets = ", ".join([f'"{k}"=?' for k in body_changes.keys()])
-            vals = list(body_changes.values()) + [body_id]
-            cur.execute(f'UPDATE "Data_CarBody" SET {sets} WHERE "Id"=?', vals)
-            updated["Data_CarBody"] = cur.rowcount
-
-    con.commit()
-    con.close()
-    return updated
-
-
-# -----------------------------
-# Integrity Checker
-# -----------------------------
-
-def integrity_check(db_path: Path, year_marker: Optional[int] = None, min_id: int = 2000) -> List[str]:
-    con = _connect(db_path)
-    cur = con.cursor()
-    tables = set(_list_tables(cur))
-
-    issues: List[str] = []
-
-    if "Data_Car" not in tables:
-        con.close()
-        return ["Missing Data_Car table."]
-
-    if year_marker is None:
-        cur.execute('SELECT Id, MediaName, Year FROM Data_Car WHERE Id>=? ORDER BY Id', (min_id,))
-    else:
-        cur.execute('SELECT Id, MediaName, Year FROM Data_Car WHERE Id>=? AND Year=? ORDER BY Id', (min_id, year_marker))
-    cars = cur.fetchall()
-
-    upgrade_tables = [t for t in tables if t.lower().startswith("list_upgrade")]
-
-    def cols_of(t: str) -> List[str]:
-        return _cols(_table_info(cur, t))
-
-    for r in cars:
-        cid = int(r["Id"])
-        media = r["MediaName"] if r["MediaName"] else "(no MediaName)"
-
-        body_id = get_car_body_id(db_path, cid)
-
-        if "Data_CarBody" in tables:
-            cur.execute('SELECT COUNT(*) AS c FROM Data_CarBody WHERE Id=?', (body_id,))
-            if int(cur.fetchone()["c"] or 0) == 0:
-                issues.append(f"Car {cid} ({media}): Missing Data_CarBody.Id={body_id} (blank/crash risk)")
-
-        found_any_upgrade = False
-        for t in upgrade_tables:
-            cols = cols_of(t)
-            if "Ordinal" in cols:
-                cur.execute(f'SELECT 1 FROM "{t}" WHERE "Ordinal"=? LIMIT 1', (cid,))
-                if cur.fetchone():
-                    found_any_upgrade = True
-                    break
-            else:
-                body_cols = [c for c in ["CarBodyID", "CarBodyId", "CarbodyId"] if c in cols]
-                if body_cols:
-                    bc = body_cols[0]
-                    cur.execute(f'SELECT 1 FROM "{t}" WHERE "{bc}"=? LIMIT 1', (body_id,))
-                    if cur.fetchone():
-                        found_any_upgrade = True
-                        break
-
-        if not found_any_upgrade and upgrade_tables:
-            issues.append(f"Car {cid} ({media}): No rows found in any List_Upgrade* table (may be OK, but unusual)")
-
-    con.close()
-    return issues
-
-
-# -----------------------------
-# Delete helpers
-# -----------------------------
-
-def _delete_where(cur: sqlite3.Cursor, table: str, where_sql: str, params: tuple) -> int:
-    cur.execute(f'DELETE FROM "{table}" WHERE {where_sql}', params)
-    return cur.rowcount
-
-
-def delete_car(db_path: Path, car_id: int) -> Dict[str, int]:
-    con = _connect(db_path)
-    cur = con.cursor()
-
-    tables = _list_tables(cur)
-    deleted: Dict[str, int] = {}
-
-    def record(t: str, n: int):
-        if n:
-            deleted[t] = deleted.get(t, 0) + n
-
-    body_cols = ["CarBodyID", "CarBodyId", "CarbodyId"]
-    upgrade_tables = [t for t in tables if t.lower().startswith("list_upgrade")]
-
-    body_id = get_car_body_id(db_path, car_id)
-
-    for t in upgrade_tables:
-        cols_t = _cols(_table_info(cur, t))
-        if "Ordinal" in cols_t:
-            record(t, _delete_where(cur, t, '"Ordinal"=?', (car_id,)))
-        else:
-            bc = next((c for c in body_cols if c in cols_t), None)
-            if bc:
-                record(t, _delete_where(cur, t, f'"{bc}"=?', (body_id,)))
-
-    for t in tables:
-        if t in upgrade_tables:
-            continue
-        cols_t = _cols(_table_info(cur, t))
-        if "Ordinal" in cols_t:
-            record(t, _delete_where(cur, t, '"Ordinal"=?', (car_id,)))
-
-    for t in tables:
-        if t in upgrade_tables:
-            continue
-        cols_t = _cols(_table_info(cur, t))
-        bc = next((c for c in body_cols if c in cols_t), None)
-        if bc:
-            record(t, _delete_where(cur, t, f'"{bc}"=?', (body_id,)))
-
-    for t in tables:
-        cols_t = _cols(_table_info(cur, t))
-        if "CarId" in cols_t:
-            record(t, _delete_where(cur, t, '"CarId"=?', (car_id,)))
-        if "CarID" in cols_t:
-            record(t, _delete_where(cur, t, '"CarID"=?', (car_id,)))
-
-    if "Data_CarBody" in set(tables):
-        record("Data_CarBody", _delete_where(cur, "Data_CarBody", '"Id"=?', (body_id,)))
-    record("Data_Car", _delete_where(cur, "Data_Car", '"Id"=?', (car_id,)))
-
-    con.commit()
-    con.close()
-    return dict(sorted(deleted.items(), key=lambda kv: (-kv[1], kv[0])))
-
-
-def get_car_ids_by_year(db_path: Path, year: int) -> List[int]:
-    con = _connect(db_path)
-    cur = con.cursor()
-    cur.execute('SELECT Id FROM Data_Car WHERE Year=?', (year,))
-    ids = [int(r["Id"]) for r in cur.fetchall()]
-    con.close()
-    return ids
-
-
-def get_cloned_car_ids(db_path: Path, min_id: int = 2000) -> List[int]:
-    con = _connect(db_path)
-    cur = con.cursor()
-    cur.execute('SELECT Id FROM Data_Car WHERE Id>=? ORDER BY Id', (min_id,))
-    ids = [int(r["Id"]) for r in cur.fetchall()]
-    con.close()
-    return ids

@@ -4,25 +4,45 @@ from __future__ import annotations
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import traceback
 
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
 import constructor_engine as ce
 
-# Optional: use CarCloner engine if present (for cloning tab + engine cloning)
+
+# Defaults so UI callbacks never crash with NameError
+clone_car_between = None
+suggest_next_car_id = None
+clone_engine_to_main = None
+suggest_next_engine_id = None
+cloner_import_error = None
 try:
-    from cloner_engine import (  # type: ignore
-        clone_car_between,
-        suggest_next_car_id,
-        clone_engine_to_main,
-        suggest_next_engine_id,
-    )
-except Exception:
-    clone_car_between = None
-    suggest_next_car_id = None
+    import importlib
+    import sys
+
+    if "cloner_engine" in sys.modules:
+        del sys.modules["cloner_engine"]
+
+    import cloner_engine as cl
+    importlib.reload(cl)
+
+    clone_engine_to_main = getattr(cl, "clone_engine_to_main", None)
+    suggest_next_engine_id = getattr(cl, "suggest_next_engine_id", None)
+    clone_car_between = getattr(cl, "clone_car_between", None)
+    suggest_next_car_id = getattr(cl, "suggest_next_car_id", None)
+
+except Exception as e:
+    cloner_import_error = traceback.format_exc()
     clone_engine_to_main = None
     suggest_next_engine_id = None
+
+    print("==== CLONER ENGINE IMPORT FAILED ====")
+    print(cloner_import_error)
+    print("====================================")
+
+
 
 
 APP_TITLE = f"Forza Constructor Studio ({ce.CONSTRUCTOR_VERSION})"
@@ -51,6 +71,104 @@ class ConstructorApp(tk.Tk):
     # ----------------------------
     # UI build
     # ----------------------------
+    def _resolve_source_path(self, source_value: str) -> Optional[Path]:
+        """
+        source_value can be a full path OR just a filename.
+        We resolve it against self.sources.
+        """
+        if not source_value:
+            return None
+
+        p = Path(source_value)
+        if p.exists():
+            return p
+
+        # Try match by basename against loaded sources
+        sv = source_value.lower()
+        for sp in self.sources:
+            if sp.name.lower() == sv:
+                return sp
+
+        return None
+
+    def clone_selected_engine_into_main(self):
+        if clone_engine_to_main is None:
+            messagebox.showerror(
+                "Cloner not available",
+                cloner_import_error or "Unknown import error"
+            )
+            return
+        if not self.main_db:
+            messagebox.showerror("Missing MAIN", "Select MAIN SLT first.")
+            return
+        if self.selected_engine_id is None:
+            messagebox.showerror("No engine selected", "Select an engine in the engine list first.")
+            return
+
+        # Resolve source path robustly
+        if not self.selected_engine_source or not Path(self.selected_engine_source).exists():
+            messagebox.showerror("Bad source", "Could not resolve engine source SLT path. Try Reload sources.")
+            return
+
+        src_path = Path(self.selected_engine_source)
+        src_engine_id = int(self.selected_engine_id)
+
+        try:
+            new_engine_id = int(self.new_engine_id_var.get())
+        except Exception:
+            messagebox.showerror("Invalid EngineID", "New EngineID must be an integer.")
+            return
+
+        # Backup MAIN
+        try:
+            backup_path = ce.backup_db(self.main_db)
+        except Exception as e:
+            messagebox.showerror("Backup failed", str(e))
+            return
+
+        try:
+            clone_engine_to_main(
+                source_db=src_path,
+                main_db=self.main_db,
+                source_engine_id=src_engine_id,
+                new_engine_id=new_engine_id,
+            )
+        except Exception as e:
+            messagebox.showerror("Clone engine failed", str(e))
+            return
+
+        self._log(
+            "Engine cloned ✅\n"
+            f"Source: {src_path.name} — EngineID {src_engine_id}\n"
+            f"New in MAIN: EngineID {new_engine_id}\n"
+            f"Backup: {backup_path}\n\n"
+        )
+        messagebox.showinfo("Engine cloned", f"Cloned Engine {src_engine_id} → {new_engine_id} into MAIN.")
+
+        self.refresh_engine_list()
+        
+    def _suggest_engine_id(self):
+        if suggest_next_engine_id is None:
+            msg = "suggest_next_engine_id not available (cloner_engine import failed)."
+            if cloner_import_error:
+                msg += f"\n\nImport error:\n{cloner_import_error}"
+            messagebox.showerror("Suggest EngineID failed", msg)
+            return
+
+        if not self.main_db:
+            messagebox.showerror("Missing MAIN", "Select MAIN SLT first.")
+            return
+
+        try:
+            # Scan MAIN + DLC sources to find true highest EngineID, then suggest next
+            next_id = suggest_next_engine_id(main_db=self.main_db, min_id=2000, aux_sources=self.sources)
+            self.new_engine_id_var.set(int(next_id))
+            self._log(f"Suggested next EngineID: {next_id}\n")
+        except Exception as e:
+            messagebox.showerror("Suggest EngineID failed", str(e))
+
+
+
     def _build_ui(self):
         top = ttk.Frame(self)
         top.pack(side="top", fill="x", padx=10, pady=8)
@@ -144,6 +262,7 @@ class ConstructorApp(tk.Tk):
     # ----------------------------
     # NEW TAB: Cloner
     # ----------------------------
+    
     def _build_tab_cloner(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="Cloner")
@@ -189,7 +308,10 @@ class ConstructorApp(tk.Tk):
 
     def _cloner_suggest_next_id(self):
         if suggest_next_car_id is None:
-            messagebox.showerror("Cloner not available", "cloner_engine.py is missing or failed to import.")
+            messagebox.showerror(
+                "Cloner not available",
+                cloner_import_error or "Unknown import error"
+            )
             return
         if not self.main_db:
             messagebox.showerror("Missing MAIN", "Select MAIN SLT first.")
@@ -203,7 +325,10 @@ class ConstructorApp(tk.Tk):
 
     def clone_selected_car_into_main(self):
         if clone_car_between is None:
-            messagebox.showerror("Cloner not available", "cloner_engine.py is missing or failed to import.")
+            messagebox.showerror(
+                "Cloner not available",
+                cloner_import_error or "Unknown import error"
+            )
             return
         if not self.main_db:
             messagebox.showerror("Missing MAIN", "Select MAIN SLT first.")
@@ -273,7 +398,7 @@ class ConstructorApp(tk.Tk):
 
     def _build_tab_car(self):
         tab = ttk.Frame(self.nb)
-        self.nb.add(tab, text="Car (Data_Car)")
+        self.nb.add(tab, text="General Car Info")
 
         self.car_fields: Dict[str, tk.Variable] = {}
 
@@ -358,7 +483,7 @@ class ConstructorApp(tk.Tk):
 
     def _build_tab_body(self):
         tab = ttk.Frame(self.nb)
-        self.nb.add(tab, text="Body (Data_CarBody)")
+        self.nb.add(tab, text="Car Body")
 
         self.body_fields: Dict[str, tk.Variable] = {}
         fields = [
@@ -387,7 +512,7 @@ class ConstructorApp(tk.Tk):
 
     def _build_tab_engine(self):
         tab = ttk.Frame(self.nb)
-        self.nb.add(tab, text="Engine (Lab + Assign)")
+        self.nb.add(tab, text="Engine Lab")
 
         top = ttk.Frame(tab)
         top.pack(fill="x", padx=10, pady=8)
@@ -431,15 +556,27 @@ class ConstructorApp(tk.Tk):
         assign = ttk.LabelFrame(right, text="Assign / Clone")
         assign.pack(fill="x", pady=(0, 8))
 
-        ttk.Button(assign, text="Assign selected engine as STOCK (MAIN write)",
-                   command=self.assign_selected_engine_as_stock).pack(side="left", padx=6, pady=6)
+        ttk.Button(
+            assign,
+            text="Assign selected engine as STOCK (to selected car)",
+            command=self.assign_selected_engine_as_stock,
+        ).pack(side="left", padx=6, pady=6)
 
-        self.clone_assign_btn = ttk.Button(assign, text="Clone selected engine into MAIN + Assign (if needed)",
-                                           command=self.clone_engine_then_assign)
-        self.clone_assign_btn.pack(side="left", padx=6, pady=6)
+        ttk.Button(
+            assign,
+            text="Clone selected engine into MAIN",
+            command=self.clone_selected_engine_into_main,
+        ).pack(side="left", padx=6, pady=6)
+        
+        ttk.Label(assign, text="New EngineID:").pack(side="left", padx=(20, 6))
+        self.new_engine_id_var = tk.IntVar(value=2000)
+        ttk.Entry(assign, textvariable=self.new_engine_id_var, width=10).pack(side="left")
+        ttk.Button(assign, text="Suggest", command=self._suggest_engine_id).pack(side="left", padx=6)
+
+
 
         # Engine editor fields
-        editor = ttk.LabelFrame(right, text="Engine editor (Data_Engine in MAIN only)")
+        editor = ttk.LabelFrame(right, text="Engine Editor")
         editor.pack(fill="both", expand=True)
 
         self.engine_fields: Dict[str, tk.Variable] = {}
@@ -531,10 +668,13 @@ class ConstructorApp(tk.Tk):
         btns.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Button(btns, text="Load engine fields from MAIN", command=self.load_engine_fields).pack(side="left")
         ttk.Button(btns, text="Apply engine edits to MAIN", command=self.apply_engine_fields).pack(side="left", padx=6)
+        
+ 
+
 
     def _build_tab_upgrades(self):
         tab = ttk.Frame(self.nb)
-        self.nb.add(tab, text="List_* / Upgrade editor")
+        self.nb.add(tab, text="Upgrade and Misc Editor")
 
         top = ttk.Frame(tab)
         top.pack(fill="x", padx=10, pady=8)
@@ -558,8 +698,8 @@ class ConstructorApp(tk.Tk):
 
         self.rows_tree = ttk.Treeview(left, columns=("__rowid__", "Level", "IsStock"), show="headings", height=14)
         self.rows_tree.heading("__rowid__", text="rowid")
-        self.rows_tree.heading("Level", text="Level")
-        self.rows_tree.heading("IsStock", text="IsStock")
+        self.rows_tree.heading("Level", text="Upgrade Level")
+        self.rows_tree.heading("IsStock", text="Stock? (1=yes,0=upgrade)")
         self.rows_tree.column("__rowid__", width=80, anchor="w")
         self.rows_tree.column("Level", width=80, anchor="w")
         self.rows_tree.column("IsStock", width=80, anchor="w")
@@ -646,6 +786,7 @@ class ConstructorApp(tk.Tk):
     # ----------------------------
     # Source selection
     # ----------------------------
+    
     def pick_main(self):
         fp = filedialog.askopenfilename(title="Select MAIN SLT", filetypes=[("SLT/SQLite", "*.slt *.db *.sqlite"), ("All files", "*.*")])
         if not fp:
@@ -838,20 +979,27 @@ class ConstructorApp(tk.Tk):
         for e in out[:5000]:
             self.engine_tree.insert("", "end", values=(e["EngineID"], e.get("EngineName", ""), e.get("MediaName", ""), Path(e["Source"]).name))
 
-    def on_engine_select(self, _evt=None):
+    def on_engine_select(self, event=None):
         sel = self.engine_tree.selection()
         if not sel:
             return
         vals = self.engine_tree.item(sel[0], "values")
-        self.selected_engine_id = int(vals[0])
-        src_name = vals[3]
-        src = None
-        for p in self.sources:
-            if p.name == src_name:
-                src = p
-                break
-        self.selected_engine_source = src
-        self._log(f"Selected engine: {self.selected_engine_id} ({vals[1]}) from {src_name}\n")
+
+        try:
+            self.selected_engine_id = int(vals[0])
+        except Exception:
+            self.selected_engine_id = None
+
+        # vals[3] is Source (might be only filename)
+        src = ""
+        try:
+            src = str(vals[3])
+        except Exception:
+            src = ""
+
+        self.selected_engine_source = self._resolve_source_path(src)
+
+
 
     # ----------------------------
     # Data_Car load/apply
@@ -1047,14 +1195,43 @@ class ConstructorApp(tk.Tk):
             )
             return
 
-        # Clone engine into MAIN using safe EngineID >= 2000
-        try:
-            new_eid = suggest_next_engine_id(self.main_db, min_id=2000, aux_sources=self.sources)
-            ce.backup_db(self.main_db)
-            clone_engine_to_main(self.selected_engine_source, self.main_db, self.selected_engine_id, new_eid)
-        except Exception as e:
-            messagebox.showerror("Clone engine failed", str(e))
-            return
+            # Clone engine into MAIN using safe EngineID >= 2000
+            try:
+                if not self.selected_engine_source:
+                    raise ValueError("Engine source path is missing (select an engine first).")
+
+                # Resolve source path robustly (handles cases where Source is just a filename)
+                src = Path(str(self.selected_engine_source))
+                if not src.exists():
+                    # match by basename against loaded sources
+                    match = next((p for p in self.sources if p.name.lower() == src.name.lower()), None)
+                    if not match:
+                        raise ValueError(f"Could not resolve engine source file: {self.selected_engine_source}")
+                    src = match
+
+                # Backup MAIN first
+                ce.backup_db(self.main_db)
+
+                # Suggest next EngineID considering MAIN + DLC sources
+                new_eid = suggest_next_engine_id(
+                    main_db=self.main_db,
+                    aux_sources=self.sources,   # pass the list of Paths
+                    min_id=2000,
+                )
+
+                # Clone engine (and let engine cloner also use all sources if it supports it)
+                clone_engine_to_main(
+                    source_db=src,
+                    main_db=self.main_db,
+                    source_engine_id=int(self.selected_engine_id),
+                    new_engine_id=int(new_eid),
+                    all_source_paths=self.sources,  # if your clone_engine_to_main supports it
+                )
+
+            except Exception as e:
+                messagebox.showerror("Clone engine failed", str(e))
+                return
+
 
         # Assign new engine
         try:
