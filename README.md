@@ -8,13 +8,13 @@ Overview
 
 It allows you to safely inspect, clone, and modify cars, engines, and upgrade data stored in the game’s SLT (SQLite) databases, while respecting how the game expects runtime data to be structured.
 
-The tool supports working across the MAIN SLT and any number of DLC SLTs, while **only ever writing to MAIN**.
+The tool supports working across the MAIN and any number of DLC databases, and also supports creating new databases
 
 You can use it to:
 
-*   Load the MAIN SLT and any number of DLC SLTs
+*   Load the Main game database and any number of DLC databases (SLT files)
     
-*   Clone cars safely into MAIN
+*   Clone cars safely into databases
     
 *   Clone and assign engines safely
     
@@ -35,11 +35,14 @@ This tool is designed to be **explicit, modular, and transparent**. Nothing is m
 
 Because of that:
 
-*   Always back up your files
+ *   Always back up your files
     
-*   Expect rough edges
+ *   Expect rough edges
     
-*   Treat this as a research and modding tool, not a polished product
+ *   Treat this as a research and modding tool, not a polished product
+ 
+ *   Some UI is hidden due to spacing issues - move pane width bars around to show all available UI. 
+
     
 
 **⚠️ Offline modding / research use only.** I cannot take responsibility for lost or corrupted data.
@@ -47,7 +50,7 @@ Because of that:
 General workflow
 ----------------
 
-1.  Select MAIN SLT
+1.  Select MAIN DB
     
 2.  (Optional) Select DLC folder
     
@@ -57,42 +60,29 @@ General workflow
     
 5.  Use tabs on the right to clone or edit
     
-6.  Apply changes (always writes only to MAIN)
-    
-
-### MAIN vs DLC behavior (important)
-
-*   **MAIN SLT is the only file ever modified**
-    
-*   **DLC SLTs are read-only**
-    
-*   DLC cars and engines can be selected as donors
-    
-*   If something required by a clone does not exist in MAIN, the tool will clone it automatically when needed
-    
-
-This mirrors how Forza expects data to exist at runtime and avoids crashes caused by missing dependencies.
+6.  Apply changes
+ 
 
 Top bar buttons
 ---------------
 
-### Select MAIN SLT
+### Select MAIN DB
 
-Choose the main database file. This is required before doing anything else.
+Choose the main database file. This is required before doing anything else. Generally this would be the gamedb.slt file, but it can be any SLT file. However, in order for some functionality to work, you will need to provide the location of the gamedb.slt using the **Pick Lookup DB** button.
 
 ### Select DLC Folder (optional)
 
-Choose a folder containing DLC SLTs.The tool scans recursively, so subfolders are supported.
+Choose a folder containing DLC SLTs. The tool scans recursively, so subfolders are supported.
 
 ### Reload sources
 
-Rebuilds the internal list of SLTs (MAIN + DLC).Use this whenever you change files on disk.
+Rebuilds the internal list of SLTs (MAIN + DLC). Use this whenever you change files.
 
 ### Build lookup cache
 
-Builds human-readable lookup tables (EnginePlacement, Materials, Cylinders, etc).Required for dropdowns to populate correctly.
+Builds human-readable lookup tables (EnginePlacement, Materials, Cylinders, etc). Required for dropdowns to populate correctly.
 
-### Backup MAIN now
+### Backup Database
 
 Creates a timestamped backup of the MAIN SLT.
 
@@ -137,26 +127,42 @@ Tab: Cloner
 
 ### Purpose
 
-Clone a donor car into MAIN using a proven and safe cloning workflow.
+Clone cars into the main database or a specific target database. You can also create new SLT files to be used as DLC (these need to be included in DLC folder structures, which is not covered in this readme).
+
+DB files are backed up automatically in the App Root every time an edit is performed. 
 
 ### Controls
 
 **Backup MAIN before cloning**
 Recommended. Creates a backup automatically.
 
-**New CarID**
-CarID for the cloned car.By convention, cloned cars should start at **2000 or higher**.
-
-**Suggest next**
-Finds the highest existing CarID across MAIN + DLC and suggests the next safe value.
-
 **Year marker**
-Sets Data\_Car.ModelYear for the clone (default: 6969).Used only for identification.
+Sets Data\_Car.ModelYear for the clone (default: 6969). Used only for identification.
 
-**Clone selected donor into MAIN**
-Clones the currently selected car.
+**Template database**
+Selects the database to be used as template - I've provided a file to be used here in the release. 
 
-If the donor is from DLC, MAIN is also scanned for related rows.
+**Output Database**
+Sets location and name of the target database file. **Needs to end in _merge to be used as DLC.**
+
+**Create new database + clone selected car**
+Creates file with the cloned car.
+
+**Clone selected car into Main Database**
+Clones car into main database.
+
+**Target Database**
+Selects specific database file where selected car will be cloned to.
+
+**Clone car into selected Target database**
+Clones car into selected database.
+
+**Cloning options**
+
+ - Also clone donor stock engine: clones engine and car together.
+ - Reassign Drivetrain IDs: creates new Drivetrains to be used with the cloned car, instead of using references to existing drivetrains.
+ - Clone only stock drivetrain info: only clones the stock level drivetrain entries.
+ - Force CarID: specify a specific CarID if Auto Assign is not working. **Always use Auto Assign first!**
 
 ### What gets cloned
 
@@ -164,7 +170,7 @@ If the donor is from DLC, MAIN is also scanned for related rows.
     
 *   Data\_CarBody
     
-*   Required stock upgrade rows only
+*   Upgrade parts
     
 *   Upgrade physics and references with safe re-keying
     
@@ -173,7 +179,15 @@ If the donor is from DLC, MAIN is also scanned for related rows.
 
 This avoids duplicated globals and runtime crashes.
 
-Tab: Car (Data\_Car)
+Notes:
+
+*   Cloned cars should always use CarIDs ≥ 2000
+    
+*   Default clone year marker is 6969 for filtering purpose, but can be changed.
+    
+*   Car names cannot be changed here (string tables are out of scope)
+
+Tab: General Car Info
 --------------------
 
 ### Purpose
@@ -202,13 +216,13 @@ Editable fields include:
 **Wheel diameter safety**
 Front and rear wheel diameters are clamped between **13 and 24**.
 
-**Save changes to MAIN**
-Writes changes only to MAIN.
+**Apply to DB**
+Writes changes.
 
-**Reload from selected source**
-Reloads original values from the source SLT.
+**Load from DB**
+Reloads original values from database.
 
-Tab: Body (Data\_CarBody)
+Tab: Car Body
 -------------------------
 
 ### Purpose
@@ -222,23 +236,17 @@ Editable fields:
 *   Track width
     
 *   Ride height (front and rear)
+   
     
 
-Notes:
-
-*   Cloned cars always use CarIDs ≥ 2000
-    
-*   Default clone year marker is 6969
-    
-*   Car names cannot be changed here (string tables are out of scope)
-    
-
-Tab: Engine (Lab + Assign)
+Tab: Engine lab
 --------------------------
 
 ### Purpose
 
 Manage engines and engine assignment.
+
+***Move the width pane around to see all options!**
 
 **Left side**
 List of all engines across MAIN and DLC.
@@ -248,13 +256,22 @@ Filter by EngineName or MediaName.
 
 ### Buttons
 
-**Assign selected engine as STOCK**
+**Assign to selected car**
 Assigns the selected engine as the stock engine for the active car.
 
-**Clone selected engine into MAIN + Assign**
-Clones the engine into MAIN if needed and assigns it safely.
+**Clone selected engine**
+Clones the engine into MAIN DB.
 
-### Engine editor (MAIN only)
+**Target SLT**
+Selects a specific DB file to be used.
+
+**Clone into target**
+Clones the engine into the selected target DB.
+
+**Auto Assign**
+Assigns an EngineID to be used. Choose a target SLT first, or check the highest EngineID in the list to avoid conflicts.
+
+### Engine editor
 
 Once an engine exists in MAIN, it can be edited.
 
@@ -284,9 +301,9 @@ Editable fields include:
     
 
 **Important**
-Engine cloning also clones all required TorqueCurve entries.Missing torque curves will cause crashes during race load.
+Engine cloning also clones all required TorqueCurve entries. Missing torque curves will cause crashes during race load.
 
-Tab: Upgrade Editor
+Tab: Upgrade and Misc Editor
 -------------------
 
 ### Purpose
@@ -296,7 +313,7 @@ Edit List\_Upgrade\* tables directly.
 This is an advanced feature.
 
 **Table dropdown**
-Shows all List\_Upgrade\* tables with shortened names(example: EngineCamshaft instead of List\_UpgradeEngineCamshaft)
+Shows all List\_Upgrade\* tables with shortened names (example: EngineCamshaft instead of List\_UpgradeEngineCamshaft)
 
 **Load rows**
 Loads rows relevant to the selected car.
@@ -322,10 +339,28 @@ The tool automatically detects scope:
     
 *   Delete row
     
-*   Apply edits to MAIN
-    
 
 Supports custom upgrade levels beyond the game’s default 0–3 (Stock, Sports, Semi-Professional, Professional).
+
+Tab: Spec Sheet
+-------------------------------
+
+### Purpose
+Provides general read-only information about the selected car.
+
+Tab: Diff Viewer
+-------------------------------
+
+### Purpose
+Allows to compare differences between cars.
+
+
+Tab: Engine Diff
+-------------------------------
+
+### Purpose
+Allows to compare differences between engines.
+
 
 Tab: Constructor (experimental)
 -------------------------------
@@ -343,16 +378,16 @@ Example:
 *   Drivetrain from car C
     
 
-Uses safe cloning and base-block remapping.This tab is still under heavy testing.
+Uses safe cloning and base-block remapping. This tab is still being tested and may not work.
 
 Safety notes
 ------------
 
-*   Always back up MAIN before major changes
+*   Always back up the DB files before major changes
     
 *   Avoid manual edits to global Combo\_\* tables
     
-*   Never assign multiple stock engines or drivetrains to a car
+*   Never assign multiple stock engines to a car
     
 *   Missing TorqueCurves or mismatched Combo tables will crash the game
     
@@ -385,4 +420,4 @@ If something breaks:
 
 ### Disclaimer
 
-This project is not affiliated with Turn 10 Studios or Microsoft.For educational and offline modding purposes only.
+This project is not affiliated with Turn 10 Studios or Microsoft. For educational and offline modding purposes only.
