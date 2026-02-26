@@ -303,6 +303,183 @@ Editable fields include:
 **Important**
 Engine cloning also clones all required TorqueCurve entries. Missing torque curves will cause crashes during race load.
 
+
+## Tab: Engine Creator
+
+### Purpose
+
+Create, modify, and tune engine torque curves and camshaft parameters in a structured and visual way.
+
+This tab allows editing of:
+
+-   `List_UpgradeEngineCamshaft`
+    
+-   `List_TorqueCurve`
+    
+
+It supports real-world torque/power calculations, dyno preview, and safe multi-SLT editing.
+
+All database edits are written only to the selected target database.
+
+DB files are backed up automatically in the App Root every time an edit is performed.
+
+----------
+
+### Controls
+
+**Engine Label**  
+Displays the currently selected engine (from Engine Lab).
+
+**Camshaft Level**  
+Selects which upgrade level to edit (Level 0 = stock).  
+Levels are detected across all loaded SLTs.
+
+**Load Level**  
+Loads camshaft parameters and linked torque curve data for the selected level.
+
+----------
+
+### Camshaft Parameters
+
+Edits fields in `List_UpgradeEngineCamshaft`:
+
+**RedlineRPM**  
+Maximum RPM for the engine.
+
+**StartRPM**  
+RPM at which torque curve sampling begins.
+
+**StallRPM**  
+Engine stall threshold.
+
+**TorqueCurveMaxRPM**  
+Maximum RPM used for torque curve sampling.
+
+**NumRPMEntriesArray**  
+Number of RPM samples used by the torque curve.  
+Must match `NumTorqueValues`.
+
+----------
+
+### Torque Curve
+
+Edits fields in `List_TorqueCurve`:
+
+**TorqueScale**  
+Peak torque value in Nm.  
+All torque values are scaled relative to this.
+
+**NumTorqueValues**  
+Number of torque samples (must match NumRPMEntriesArray).
+
+**Values (v0..vN)**  
+Scalar torque values (0.0–1.0+).  
+Each value represents:
+
+Torque_at_RPM = TorqueScale × scalar
+
+----------
+
+### Curve Tools
+
+**Normalize**  
+Scales all values so the highest becomes 1.0.
+
+**Clamp**  
+Limits values to safe bounds (prevents unrealistic spikes).
+
+----------
+
+### Curve Generator
+
+Allows automatic generation of torque curves using real-world engine data.
+
+**Peak Torque (Nm @ RPM)**  
+Required input.
+
+**Peak Power (HP @ RPM)**  
+Optional. Converted internally using:
+
+Torque(ft-lb) = HP × 5252 / RPM
+
+Then converted to Nm.
+
+**Anchor Points**  
+Optional additional RPM points to shape the curve.  
+Supports scalar, Nm, ft-lb, HP, and kW inputs.
+
+**Generate**  
+Creates a full torque curve across all RPM samples using interpolation.
+
+The generated curve:
+
+-   Respects discrete RPM sampling
+    
+-   Snaps peaks to nearest available sample
+    
+-   Calculates power using real torque × RPM relationship
+    
+
+----------
+
+### Dyno Preview
+
+Visualizes:
+
+-   Torque (Nm)
+    
+-   Power (HP)
+    
+-   Peak torque location
+    
+-   Peak power location
+    
+-   Redline
+    
+-   StartRPM shaded region
+    
+
+Modes:
+
+**Accurate (Start→Max)**  
+Plots curve using the exact game sampling domain.
+
+**Remapped (0→Max)**  
+Spreads samples over full RPM range for visualization purposes.
+
+----------
+
+### Apply To
+
+Select target database file where changes will be written.
+
+Display shows filename only, but internally stores full path.
+
+----------
+
+### What Gets Modified
+
+`List_UpgradeEngineCamshaft`
+
+`List_TorqueCurve`
+
+No other engine dependencies are altered.
+
+----------
+
+### Notes
+
+-   Torque curves are stored as discrete samples between StartRPM and MaxRPM.
+    
+-   Requested peak RPM values may snap to the nearest sample.
+    
+-   Power peak is derived from torque × RPM and may shift if torque does not decay fast enough.
+    
+-   For realistic behavior, StartRPM should usually be close to engine idle speed.
+    
+-   Engine structure (Data_Engine, upgrade chains, etc.) must exist before editing. Use Engine Clone for safe duplication.
+
+
 Tab: Upgrade and Misc Editor
 -------------------
 
